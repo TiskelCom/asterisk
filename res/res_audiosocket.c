@@ -44,6 +44,7 @@
 #define	MODULE_DESCRIPTION	"AudioSocket support functions for Asterisk"
 
 #define MAX_CONNECT_TIMEOUT_MSEC 2000
+#define AUDIOSOCKET_READ_TIMEOUT_MSEC 500
 
 /* Global variable to store the selected format */
 static struct ast_format *selected_format = NULL;
@@ -290,7 +291,7 @@ struct ast_frame *ast_audiosocket_receive_frame(const int svc)
 struct ast_frame *ast_audiosocket_receive_frame_with_hangup(const int svc,
 	int *const hangup)
 {
-	int i = 0, n = 0, ret = 0;
+	int i = 0, n = 0, ret = 0, poll_res;
 	struct ast_frame f = {
 		.frametype = AST_FRAME_VOICE,
 		.subclass.format = selected_format ? selected_format : ast_format_slin,
@@ -301,19 +302,51 @@ struct ast_frame *ast_audiosocket_receive_frame_with_hangup(const int svc,
 	uint8_t *kind = &header[0];
 	uint16_t *length = (uint16_t *) &header[1];
 	uint8_t *data;
+	struct pollfd pfd = { .fd = svc, .events = POLLIN };
 
 	if (hangup) {
 		*hangup = 0;
 	}
 
-	n = read(svc, &header, 3);
-	if (n == -1) {
-		ast_log(LOG_WARNING, "Failed to read header from AudioSocket because: %s\n", strerror(errno));
+	/* Wait for data to be available before reading (prevents EAGAIN on non-blocking sockets) */
+	do {
+		poll_res = ast_poll(&pfd, 1, AUDIOSOCKET_READ_TIMEOUT_MSEC);
+	} while (poll_res == -1 && errno == EINTR);
+
+	if (poll_res == 0) {
+		return &ast_null_frame;
+	}
+
+	if (poll_res < 0) {
+		ast_log(LOG_WARNING, "poll() on AudioSocket failed: %s\n", strerror(errno));
 		return NULL;
 	}
 
-	if (n == 0 || *kind == AST_AUDIOSOCKET_KIND_HANGUP) {
-		/* Socket closure or requested hangup. */
+	/* Read the 3-byte header, handling short reads and EINTR */
+	i = 0;
+	while (i < 3) {
+		n = read(svc, header + i, 3 - i);
+		if (n == -1) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK) {
+				return &ast_null_frame;
+			}
+			if (errno == EINTR) {
+				continue;
+			}
+			ast_log(LOG_WARNING, "Failed to read header from AudioSocket: %s\n",
+				strerror(errno));
+			return NULL;
+		}
+		if (n == 0) {
+			if (hangup) {
+				*hangup = 1;
+			}
+			return NULL;
+		}
+		i += n;
+	}
+
+	if (*kind == AST_AUDIOSOCKET_KIND_HANGUP) {
 		if (hangup) {
 			*hangup = 1;
 		}
@@ -321,14 +354,14 @@ struct ast_frame *ast_audiosocket_receive_frame_with_hangup(const int svc,
 	}
 
 	if (*kind != AST_AUDIOSOCKET_KIND_AUDIO) {
-		ast_log(LOG_ERROR, "Received AudioSocket message other than hangup or audio, refer to protocol specification for valid message types\n");
+		ast_log(LOG_ERROR, "Received AudioSocket message other than hangup or audio, "
+			"refer to protocol specification for valid message types\n");
 		return NULL;
 	}
 
-	/* Swap endianess of length if needed. */
 	*length = ntohs(*length);
 	if (*length < 1) {
-		ast_log(LOG_ERROR, "Invalid message length received from AudioSocket server. \n");
+		ast_log(LOG_ERROR, "Invalid message length received from AudioSocket server\n");
 		return NULL;
 	}
 
@@ -339,12 +372,26 @@ struct ast_frame *ast_audiosocket_receive_frame_with_hangup(const int svc,
 	}
 
 	ret = 0;
-	n = 0;
 	i = 0;
 	while (i < *length) {
 		n = read(svc, data + i, *length - i);
 		if (n == -1) {
-			ast_log(LOG_ERROR, "Failed to read payload from AudioSocket: %s\n", strerror(errno));
+			if (errno == EAGAIN || errno == EWOULDBLOCK) {
+				do {
+					poll_res = ast_poll(&pfd, 1, AUDIOSOCKET_READ_TIMEOUT_MSEC);
+				} while (poll_res == -1 && errno == EINTR);
+				if (poll_res > 0) {
+					continue;
+				}
+				ast_log(LOG_ERROR, "Timed out reading payload from AudioSocket\n");
+				ret = -1;
+				break;
+			}
+			if (errno == EINTR) {
+				continue;
+			}
+			ast_log(LOG_ERROR, "Failed to read payload from AudioSocket: %s\n",
+				strerror(errno));
 			ret = -1;
 			break;
 		}

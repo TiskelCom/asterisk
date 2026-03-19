@@ -39,8 +39,9 @@ RUN apt-get update && apt-get install -y \
 # Clone Asterisk repository
 RUN git clone https://github.com/asterisk/asterisk.git /usr/src/asterisk
 
-# Copy our modified res_audiosocket.c
+# Copy our modified AudioSocket sources
 COPY res/res_audiosocket.c /usr/src/asterisk/res/
+COPY channels/chan_audiosocket.c /usr/src/asterisk/channels/
 
 # Build Asterisk
 WORKDIR /usr/src/asterisk
@@ -90,9 +91,9 @@ RUN mkdir -p /var/lib/asterisk \
     && mkdir -p /var/run/asterisk \
     && mkdir -p /etc/asterisk
 
-# Set up entrypoint
+# Set up entrypoint (sed strips Windows CRLF line endings if present)
 COPY docker-entrypoint.sh /
-RUN chmod +x /docker-entrypoint.sh
+RUN sed -i 's/\r$//' /docker-entrypoint.sh && chmod +x /docker-entrypoint.sh
 
 # Set environment variables
 ENV ASTERISK_USER=asterisk \
