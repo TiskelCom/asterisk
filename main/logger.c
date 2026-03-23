@@ -643,7 +643,7 @@ static struct logchannel *find_logchannel(const char *channel)
 static struct logchannel *make_logchannel(const char *channel, const char *components, int lineno, int dynamic)
 {
 	struct logchannel *chan;
-	char *facility;
+	const char *facility;
 	struct ast_tm tm;
 	struct timeval now = ast_tvnow();
 	char datestring[256];
@@ -839,11 +839,6 @@ static int init_logger_chain(const char *altconf)
 			rotatestrategy = NONE;
 		} else {
 			fprintf(stderr, "Unknown rotatestrategy: %s\n", s);
-		}
-	} else {
-		if ((s = ast_variable_retrieve(cfg, "general", "rotatetimestamp"))) {
-			rotatestrategy = ast_true(s) ? TIMESTAMP : SEQUENTIAL;
-			fprintf(stderr, "rotatetimestamp option has been deprecated.  Please use rotatestrategy instead.\n");
 		}
 	}
 	if ((s = ast_variable_retrieve(cfg, "general", "logger_queue_limit"))) {

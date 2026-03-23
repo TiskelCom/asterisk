@@ -39,15 +39,10 @@
 #include "asterisk/module.h"
 #include "asterisk/uuid.h"
 #include "asterisk/format_cache.h"
-#include "asterisk/pbx.h"  /* For pbx_builtin_getvar_helper */
 
 #define	MODULE_DESCRIPTION	"AudioSocket support functions for Asterisk"
 
 #define MAX_CONNECT_TIMEOUT_MSEC 2000
-#define AUDIOSOCKET_READ_TIMEOUT_MSEC 500
-
-/* Global variable to store the selected format */
-static struct ast_format *selected_format = NULL;
 
 /*!
  * \internal
@@ -145,6 +140,14 @@ const int ast_audiosocket_connect(const char *server, struct ast_channel *chan)
 			continue;
 		}
 
+		/*
+		 * Disable Nagle's algorithm by setting the TCP_NODELAY socket option.
+		 * This reduces latency by preventing delays caused by packet buffering.
+		 */
+		if (setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &(int){1}, sizeof(int)) < 0) {
+			ast_log(LOG_ERROR, "Failed to set TCP_NODELAY on AudioSocket: %s\n", strerror(errno));
+		}
+
 		if (ast_connect(s, &addrs[i]) && errno == EINPROGRESS) {
 
 			if (handle_audiosocket_connection(server, addrs[i], s)) {
@@ -188,8 +191,6 @@ const int ast_audiosocket_init(const int svc, const char *id)
 	uuid_t uu;
 	int ret = 0;
 	uint8_t buf[3 + 16];
-	struct ast_channel *chan;
-	const char *forced_codec;
 
 	if (ast_strlen_zero(id)) {
 		ast_log(LOG_ERROR, "No UUID for AudioSocket\n");
@@ -200,37 +201,6 @@ const int ast_audiosocket_init(const int svc, const char *id)
 		ast_log(LOG_ERROR, "Failed to parse UUID '%s'\n", id);
 		return -1;
 	}
-
-	/* BEGIN: Codec selection based on FORCED_IN_CODEC variable */
-	chan = ast_channel_get_by_name_prefix("AudioSocket", strlen("AudioSocket"));
-	if (chan) {
-		ast_channel_lock(chan);
-		forced_codec = pbx_builtin_getvar_helper(chan, "FORCED_IN_CODEC");
-		if (!ast_strlen_zero(forced_codec)) {
-			if (strcasecmp(forced_codec, "slin") == 0) {
-				selected_format = ast_format_slin;
-				ast_log(LOG_NOTICE, "AudioSocket: Using forced codec slin\n");
-			} else if (strcasecmp(forced_codec, "slin16") == 0) {
-				selected_format = ast_format_slin16;
-				ast_log(LOG_NOTICE, "AudioSocket: Using forced codec slin16\n");
-			} else if (strcasecmp(forced_codec, "slin24") == 0) {
-				selected_format = ast_format_slin24;
-				ast_log(LOG_NOTICE, "AudioSocket: Using forced codec slin24\n");
-			} else {
-				selected_format = ast_format_slin;
-				ast_log(LOG_NOTICE, "AudioSocket: Unknown forced codec '%s', using default slin16\n", forced_codec);
-			}
-		} else {
-			selected_format = ast_format_slin;
-			ast_log(LOG_NOTICE, "AudioSocket: No forced codec specified, using default slin16\n");
-		}
-		ast_channel_unlock(chan);
-		ast_channel_unref(chan);
-	} else {
-		selected_format = ast_format_slin;
-		ast_log(LOG_NOTICE, "AudioSocket: Could not find channel, using default slin16\n");
-	}
-	/* END: Codec selection based on FORCED_IN_CODEC variable */
 
 	buf[0] = AST_AUDIOSOCKET_KIND_UUID;
 	buf[1] = 0x00;
@@ -260,7 +230,28 @@ const int ast_audiosocket_send_frame(const int svc, const struct ast_frame *f)
 			depends on agreed upon audio codec for channel driver interface. */
 		switch (f->frametype) {
 			case AST_FRAME_VOICE:
-				buf[0] = AST_AUDIOSOCKET_KIND_AUDIO;
+				if (ast_format_cmp(f->subclass.format, ast_format_slin) == AST_FORMAT_CMP_EQUAL) {
+					buf[0] = AST_AUDIOSOCKET_KIND_AUDIO;
+				} else if (ast_format_cmp(f->subclass.format, ast_format_slin12) == AST_FORMAT_CMP_EQUAL) {
+					buf[0] = AST_AUDIOSOCKET_KIND_AUDIO_SLIN12;
+				} else if (ast_format_cmp(f->subclass.format, ast_format_slin16) == AST_FORMAT_CMP_EQUAL) {
+					buf[0] = AST_AUDIOSOCKET_KIND_AUDIO_SLIN16;
+				} else if (ast_format_cmp(f->subclass.format, ast_format_slin24) == AST_FORMAT_CMP_EQUAL) {
+					buf[0] = AST_AUDIOSOCKET_KIND_AUDIO_SLIN24;
+				} else if (ast_format_cmp(f->subclass.format, ast_format_slin32) == AST_FORMAT_CMP_EQUAL) {
+					buf[0] = AST_AUDIOSOCKET_KIND_AUDIO_SLIN32;
+				} else if (ast_format_cmp(f->subclass.format, ast_format_slin44) == AST_FORMAT_CMP_EQUAL) {
+					buf[0] = AST_AUDIOSOCKET_KIND_AUDIO_SLIN44;
+				} else if (ast_format_cmp(f->subclass.format, ast_format_slin48) == AST_FORMAT_CMP_EQUAL) {
+					buf[0] = AST_AUDIOSOCKET_KIND_AUDIO_SLIN48;
+				} else if (ast_format_cmp(f->subclass.format, ast_format_slin96) == AST_FORMAT_CMP_EQUAL) {
+					buf[0] = AST_AUDIOSOCKET_KIND_AUDIO_SLIN96;
+				} else if (ast_format_cmp(f->subclass.format, ast_format_slin192) == AST_FORMAT_CMP_EQUAL) {
+					buf[0] = AST_AUDIOSOCKET_KIND_AUDIO_SLIN192;
+				} else {
+					buf[0] = AST_AUDIOSOCKET_KIND_AUDIO;
+				}
+
 				*length = htons(datalen);
 				memcpy(&buf[3], f->data.ptr, datalen);
 				break;
@@ -291,10 +282,9 @@ struct ast_frame *ast_audiosocket_receive_frame(const int svc)
 struct ast_frame *ast_audiosocket_receive_frame_with_hangup(const int svc,
 	int *const hangup)
 {
-	int i = 0, n = 0, ret = 0, poll_res;
+	int i = 0, n = 0, ret = 0;
 	struct ast_frame f = {
 		.frametype = AST_FRAME_VOICE,
-		.subclass.format = selected_format ? selected_format : ast_format_slin,
 		.src = "AudioSocket",
 		.mallocd = AST_MALLOCD_DATA,
 	};
@@ -302,66 +292,81 @@ struct ast_frame *ast_audiosocket_receive_frame_with_hangup(const int svc,
 	uint8_t *kind = &header[0];
 	uint16_t *length = (uint16_t *) &header[1];
 	uint8_t *data;
-	struct pollfd pfd = { .fd = svc, .events = POLLIN };
 
 	if (hangup) {
 		*hangup = 0;
 	}
 
-	/* Wait for data to be available before reading (prevents EAGAIN on non-blocking sockets) */
-	do {
-		poll_res = ast_poll(&pfd, 1, AUDIOSOCKET_READ_TIMEOUT_MSEC);
-	} while (poll_res == -1 && errno == EINTR);
-
-	if (poll_res == 0) {
-		return &ast_null_frame;
-	}
-
-	if (poll_res < 0) {
-		ast_log(LOG_WARNING, "poll() on AudioSocket failed: %s\n", strerror(errno));
-		return NULL;
-	}
-
-	/* Read the 3-byte header, handling short reads and EINTR */
-	i = 0;
 	while (i < 3) {
 		n = read(svc, header + i, 3 - i);
 		if (n == -1) {
 			if (errno == EAGAIN || errno == EWOULDBLOCK) {
-				return &ast_null_frame;
+				int poll_result = ast_wait_for_input(svc, 5);
+
+				if (poll_result == 1) {
+					continue;
+				} else if (poll_result == 0) {
+					ast_debug(1, "Poll timed out while waiting for header data\n");
+					continue;
+				} else {
+					ast_log(LOG_WARNING, "Poll error: %s\n", strerror(errno));
+				}
 			}
-			if (errno == EINTR) {
-				continue;
-			}
-			ast_log(LOG_WARNING, "Failed to read header from AudioSocket: %s\n",
-				strerror(errno));
+
+			ast_log(LOG_ERROR, "Failed to read header from AudioSocket because: %s\n", strerror(errno));
 			return NULL;
 		}
 		if (n == 0) {
-			if (hangup) {
-				*hangup = 1;
-			}
-			return NULL;
+			break;
 		}
 		i += n;
 	}
 
-	if (*kind == AST_AUDIOSOCKET_KIND_HANGUP) {
+	if (n == 0 || *kind == AST_AUDIOSOCKET_KIND_HANGUP) {
+		/* Socket closure or requested hangup. */
 		if (hangup) {
 			*hangup = 1;
 		}
 		return NULL;
 	}
 
-	if (*kind != AST_AUDIOSOCKET_KIND_AUDIO) {
-		ast_log(LOG_ERROR, "Received AudioSocket message other than hangup or audio, "
-			"refer to protocol specification for valid message types\n");
-		return NULL;
+	switch (*kind) {
+		case AST_AUDIOSOCKET_KIND_AUDIO:
+			f.subclass.format = ast_format_slin;
+			break;
+		case AST_AUDIOSOCKET_KIND_AUDIO_SLIN12:
+			f.subclass.format = ast_format_slin12;
+			break;
+		case AST_AUDIOSOCKET_KIND_AUDIO_SLIN16:
+			f.subclass.format = ast_format_slin16;
+			break;
+		case AST_AUDIOSOCKET_KIND_AUDIO_SLIN24:
+			f.subclass.format = ast_format_slin24;
+			break;
+		case AST_AUDIOSOCKET_KIND_AUDIO_SLIN32:
+			f.subclass.format = ast_format_slin32;
+			break;
+		case AST_AUDIOSOCKET_KIND_AUDIO_SLIN44:
+			f.subclass.format = ast_format_slin44;
+			break;
+		case AST_AUDIOSOCKET_KIND_AUDIO_SLIN48:
+			f.subclass.format = ast_format_slin48;
+			break;
+		case AST_AUDIOSOCKET_KIND_AUDIO_SLIN96:
+			f.subclass.format = ast_format_slin96;
+			break;
+		case AST_AUDIOSOCKET_KIND_AUDIO_SLIN192:
+			f.subclass.format = ast_format_slin192;
+			break;
+		default:
+			ast_log(LOG_ERROR, "Received AudioSocket message other than hangup or audio, refer to protocol specification for valid message types\n");
+			return NULL;
 	}
 
+	/* Swap endianess of length if needed. */
 	*length = ntohs(*length);
 	if (*length < 1) {
-		ast_log(LOG_ERROR, "Invalid message length received from AudioSocket server\n");
+		ast_log(LOG_ERROR, "Invalid message length received from AudioSocket server. \n");
 		return NULL;
 	}
 
@@ -372,26 +377,24 @@ struct ast_frame *ast_audiosocket_receive_frame_with_hangup(const int svc,
 	}
 
 	ret = 0;
+	n = 0;
 	i = 0;
 	while (i < *length) {
 		n = read(svc, data + i, *length - i);
 		if (n == -1) {
 			if (errno == EAGAIN || errno == EWOULDBLOCK) {
-				do {
-					poll_res = ast_poll(&pfd, 1, AUDIOSOCKET_READ_TIMEOUT_MSEC);
-				} while (poll_res == -1 && errno == EINTR);
-				if (poll_res > 0) {
+				int poll_result = ast_wait_for_input(svc, 5);
+
+				if (poll_result == 1) {
 					continue;
+				} else if (poll_result == 0) {
+					ast_log(LOG_WARNING, "Poll timed out while waiting for data\n");
+				} else {
+					ast_log(LOG_WARNING, "Poll error: %s\n", strerror(errno));
 				}
-				ast_log(LOG_ERROR, "Timed out reading payload from AudioSocket\n");
-				ret = -1;
-				break;
 			}
-			if (errno == EINTR) {
-				continue;
-			}
-			ast_log(LOG_ERROR, "Failed to read payload from AudioSocket: %s\n",
-				strerror(errno));
+
+			ast_log(LOG_ERROR, "Failed to read payload from AudioSocket: %s\n", strerror(errno));
 			ret = -1;
 			break;
 		}

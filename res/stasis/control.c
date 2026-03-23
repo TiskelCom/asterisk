@@ -637,6 +637,21 @@ int stasis_app_control_ring_stop(struct stasis_app_control *control)
 	return 0;
 }
 
+static int app_control_progress(struct stasis_app_control *control,
+	struct ast_channel *chan, void *data)
+{
+	ast_indicate(control->channel, AST_CONTROL_PROGRESS);
+
+	return 0;
+}
+
+int stasis_app_control_progress(struct stasis_app_control *control)
+{
+	stasis_app_send_command_async(control, app_control_progress, NULL, NULL);
+
+	return 0;
+}
+
 struct stasis_app_control_mute_data {
 	enum ast_frame_type frametype;
 	unsigned int direction;
@@ -1215,8 +1230,15 @@ static void bridge_after_cb_failed(enum ast_bridge_after_cb_reason reason,
  * to keep the timeout information local to the channel.
  * That is what this datastore is for
  */
+
+static void timeout_datastore_data_destructor(void *data)
+{
+	ast_free(data);
+}
+
 struct ast_datastore_info timeout_datastore = {
 	.type = "ARI dial timeout",
+	.destroy = timeout_datastore_data_destructor,
 };
 
 static int hangup_channel(struct stasis_app_control *control,

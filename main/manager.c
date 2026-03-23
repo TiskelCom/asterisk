@@ -36,16 +36,12 @@
  * \ref amiconf
  */
 
-/*! \li \ref manager.c uses the configuration file \ref manager.conf and \ref users.conf
+/*! \li \ref manager.c uses the configuration file \ref manager.conf
  * \addtogroup configuration_file
  */
 
 /*! \page manager.conf manager.conf
  * \verbinclude manager.conf.sample
- */
-
-/*! \page users.conf users.conf
- * \verbinclude users.conf.sample
  */
 
 /*** MODULEINFO
@@ -1121,6 +1117,7 @@ static char *handle_showmancmd(struct ast_cli_entry *e, int cmd, struct ast_cli_
 #ifdef AST_XML_DOCS
 				if (cur->docsrc == AST_XML_DOC) {
 					char *synopsis = ast_xmldoc_printable(S_OR(cur->synopsis, "Not available"), 1);
+					char *provided_by = ast_xmldoc_printable(S_OR(cur->provided_by, "Not available"), 1);
 					char *since = ast_xmldoc_printable(S_OR(cur->since, "Not available"), 1);
 					char *description = ast_xmldoc_printable(S_OR(cur->description, "Not available"), 1);
 					char *syntax = ast_xmldoc_printable(S_OR(cur->syntax, "Not available"), 1);
@@ -1129,9 +1126,10 @@ static char *handle_showmancmd(struct ast_cli_entry *e, int cmd, struct ast_cli_
 					char *seealso = ast_xmldoc_printable(S_OR(cur->seealso, "Not available"), 1);
 					char *responses = ast_xmldoc_printable("None", 1);
 
-					if (!synopsis || !since || !description || !syntax || !arguments
+					if (!synopsis || !provided_by || !since || !description || !syntax || !arguments
 							|| !privilege || !seealso || !responses) {
 						ast_free(synopsis);
+						ast_free(provided_by);
 						ast_free(since);
 						ast_free(description);
 						ast_free(syntax);
@@ -1161,9 +1159,12 @@ static char *handle_showmancmd(struct ast_cli_entry *e, int cmd, struct ast_cli_
 						"%s\n\n"
 						COLORIZE_FMT "\n"
 						"%s\n\n"
+						COLORIZE_FMT "\n"
+						"%s\n\n"
 						COLORIZE_FMT "\n",
 						ast_term_color(COLOR_MAGENTA, 0), cur->action, ast_term_reset(),
 						COLORIZE(COLOR_MAGENTA, 0, "[Synopsis]"), synopsis,
+						COLORIZE(COLOR_MAGENTA, 0, "[Provided By]"), provided_by,
 						COLORIZE(COLOR_MAGENTA, 0, "[Since]"), since,
 						COLORIZE(COLOR_MAGENTA, 0, "[Description]"), description,
 						COLORIZE(COLOR_MAGENTA, 0, "[Syntax]"), syntax,
@@ -1203,6 +1204,7 @@ static char *handle_showmancmd(struct ast_cli_entry *e, int cmd, struct ast_cli_
 						);
 
 					ast_free(synopsis);
+					ast_free(provided_by);
 					ast_free(since);
 					ast_free(description);
 					ast_free(syntax);
@@ -3377,7 +3379,7 @@ static int action_login(struct mansession *s, const struct message *m)
 	astman_send_ack(s, m, "Authentication accepted");
 	if ((s->session->send_events & EVENT_FLAG_SYSTEM)
 		&& (s->session->readperm & EVENT_FLAG_SYSTEM)
-		&& ast_test_flag(&ast_options, AST_OPT_FLAG_FULLY_BOOTED)) {
+		&& ast_fully_booted) {
 		struct ast_str *auth = ast_str_alloca(MAX_AUTH_PERM_STRING);
 		const char *cat_str = authority_to_str(EVENT_FLAG_SYSTEM, &auth);
 		long uptime = 0;
@@ -5528,6 +5530,9 @@ static int action_presencestate(struct mansession *s, const struct message *m)
 	}
 	astman_append(s, "\r\n");
 
+	ast_free(subtype);
+	ast_free(message);
+
 	return 0;
 }
 
@@ -5706,7 +5711,7 @@ static int action_filter(struct mansession *s, const struct message *m)
 		}
 
 		res = manager_add_filter(criteria, filter, s->session->includefilters, s->session->excludefilters);
-		ast_std_free(criteria);
+		ast_free(criteria);
 		if (res != FILTER_SUCCESS) {
 			if (res == FILTER_ALLOC_FAILED) {
 				astman_send_error(s, m, "Internal Error. Failed to allocate regex for filter");
@@ -5757,7 +5762,7 @@ static enum add_filter_result manager_add_filter(
 	RAII_VAR(struct event_filter_entry *, filter_entry,
 		ao2_t_alloc(sizeof(*filter_entry), event_filter_destructor, "event_filter allocation"),
 		ao2_cleanup);
-	char *options_start = NULL;
+	const char *options_start = NULL;
 	SCOPE_ENTER(3, "manager_add_filter(%s, %s, %p, %p)", criteria, filter_pattern, includefilters, excludefilters);
 
 	if (!filter_entry) {
@@ -7840,6 +7845,11 @@ int ast_manager_register2(const char *action, int auth, int (*func)(struct manse
 		return -1;
 	}
 
+	if (ast_string_field_init_extended(cur, provided_by)) {
+		ao2_t_ref(cur, -1, "action object creation failed");
+		return -1;
+	}
+
 	cur->action = action;
 	cur->authority = auth;
 	cur->func = func;
@@ -7854,6 +7864,10 @@ int ast_manager_register2(const char *action, int auth, int (*func)(struct manse
 
 		tmpxml = ast_xmldoc_build_synopsis("manager", action, NULL);
 		ast_string_field_set(cur, synopsis, tmpxml);
+		ast_free(tmpxml);
+
+		tmpxml = ast_xmldoc_build_provided_by("manager", action, NULL);
+		ast_string_field_set(cur, provided_by, tmpxml);
 		ast_free(tmpxml);
 
 		tmpxml = ast_xmldoc_build_syntax("manager", action, NULL);
@@ -9174,21 +9188,32 @@ static char *handle_manager_show_settings(struct ast_cli_entry *e, int cmd, stru
 
 #ifdef AST_XML_DOCS
 
-static int ast_xml_doc_item_cmp_fn(const void *a, const void *b)
+/* Sort function for ast_xml_doc_item by name field */
+AO2_STRING_FIELD_SORT_FN(ast_xml_doc_item, name);
+
+static int event_max_name_len_cb(void *obj, void *arg, void *data, int flags)
 {
-	struct ast_xml_doc_item **item_a = (struct ast_xml_doc_item **)a;
-	struct ast_xml_doc_item **item_b = (struct ast_xml_doc_item **)b;
-	return strcmp((*item_a)->name, (*item_b)->name);
+	struct ast_xml_doc_item *item = obj;
+	int *max_len = data;
+	int len = strlen(item->name);
+
+	if (len > *max_len) {
+		*max_len = len;
+	}
+
+	return 0;
 }
 
 static char *handle_manager_show_events(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
 {
 	struct ao2_container *events;
-	struct ao2_iterator *it_events;
+	struct ao2_container *sorted_events;
+	struct ao2_iterator it_events;
 	struct ast_xml_doc_item *item;
-	struct ast_xml_doc_item **items;
 	struct ast_str *buffer;
-	int i = 0, totalitems = 0;
+	int col = 0;
+	int maxlen = 0;
+	const char *dashes = "--------------------------------------------------------------------------------";
 
 	switch (cmd) {
 	case CLI_INIT:
@@ -9217,46 +9242,42 @@ static char *handle_manager_show_events(struct ast_cli_entry *e, int cmd, struct
 	}
 
 	ao2_lock(events);
-	if (!(it_events = ao2_callback(events, OBJ_MULTIPLE | OBJ_NOLOCK, NULL, NULL))) {
+	sorted_events = ao2_container_alloc_rbtree(AO2_ALLOC_OPT_LOCK_NOLOCK,
+		AO2_CONTAINER_ALLOC_OPT_DUPS_REPLACE,
+		ast_xml_doc_item_sort_fn, NULL);
+	if (!sorted_events) {
 		ao2_unlock(events);
-		ast_log(AST_LOG_ERROR, "Unable to create iterator for events container\n");
+		ast_log(AST_LOG_ERROR, "Unable to create sorted container for events\n");
 		ast_free(buffer);
 		ao2_ref(events, -1);
 		return CLI_SUCCESS;
 	}
-	if (!(items = ast_calloc(sizeof(struct ast_xml_doc_item *), ao2_container_count(events)))) {
-		ao2_unlock(events);
-		ast_log(AST_LOG_ERROR, "Unable to create temporary sorting array for events\n");
-		ao2_iterator_destroy(it_events);
-		ast_free(buffer);
-		ao2_ref(events, -1);
-		return CLI_SUCCESS;
-	}
+	ao2_container_dup(sorted_events, events, 0);
 	ao2_unlock(events);
+	ao2_ref(events, -1);
 
-	while ((item = ao2_iterator_next(it_events))) {
-		items[totalitems++] = item;
-		ao2_ref(item, -1);
-	}
-
-	qsort(items, totalitems, sizeof(struct ast_xml_doc_item *), ast_xml_doc_item_cmp_fn);
+	ao2_callback_data(sorted_events, OBJ_NODATA, event_max_name_len_cb, NULL, &maxlen);
+	it_events = ao2_iterator_init(sorted_events, AO2_ITERATOR_DONTLOCK);
 
 	ast_cli(a->fd, "Events:\n");
-	ast_cli(a->fd, "  --------------------  --------------------  --------------------  \n");
-	for (i = 0; i < totalitems; i++) {
-		ast_str_append(&buffer, 0, "  %-20.20s", items[i]->name);
-		if ((i + 1) % 3 == 0) {
+	ast_cli(a->fd, "  %.*s  %.*s  %.*s  \n", maxlen, dashes, maxlen, dashes, maxlen, dashes);
+
+	while ((item = ao2_iterator_next(&it_events))) {
+		ast_str_append(&buffer, 0, "  %-*s", maxlen, item->name);
+		if (++col % 3 == 0) {
 			ast_cli(a->fd, "%s\n", ast_str_buffer(buffer));
 			ast_str_set(&buffer, 0, "%s", "");
 		}
-	}
-	if ((i + 1) % 3 != 0) {
+		ao2_ref(item, -1);
+ 	}
+	ao2_iterator_destroy(&it_events);
+
+	if (col % 3 != 0) {
 		ast_cli(a->fd, "%s\n", ast_str_buffer(buffer));
 	}
+	ast_cli(a->fd, "\n%d events registered.\n", col);
 
-	ao2_iterator_destroy(it_events);
-	ast_free(items);
-	ao2_ref(events, -1);
+	ao2_ref(sorted_events, -1);
 	ast_free(buffer);
 
 	return CLI_SUCCESS;
@@ -9264,16 +9285,17 @@ static char *handle_manager_show_events(struct ast_cli_entry *e, int cmd, struct
 
 static void print_event_instance(struct ast_cli_args *a, struct ast_xml_doc_item *instance)
 {
-	char *since, *syntax, *description, *synopsis, *seealso, *arguments;
+	char *since, *syntax, *provided_by, *description, *synopsis, *seealso, *arguments;
 
 	synopsis = ast_xmldoc_printable(AS_OR(instance->synopsis, "Not available"), 1);
+	provided_by = ast_xmldoc_printable(AS_OR(instance->provided_by, "Not available"), 1);
 	since = ast_xmldoc_printable(AS_OR(instance->since, "Not available"), 1);
 	description = ast_xmldoc_printable(AS_OR(instance->description, "Not available"), 1);
 	syntax = ast_xmldoc_printable(AS_OR(instance->syntax, "Not available"), 1);
 	arguments = ast_xmldoc_printable(AS_OR(instance->arguments, "Not available"), 1);
 	seealso = ast_xmldoc_printable(AS_OR(instance->seealso, "Not available"), 1);
 
-	if (!synopsis || !since || !description || !syntax || !arguments || !seealso) {
+	if (!synopsis || !provided_by || !since || !description || !syntax || !arguments || !seealso) {
 		ast_cli(a->fd, "Error: Memory allocation failed\n");
 		goto free_docs;
 	}
@@ -9291,9 +9313,12 @@ static void print_event_instance(struct ast_cli_args *a, struct ast_xml_doc_item
 		COLORIZE_FMT "\n"
 		"%s\n\n"
 		COLORIZE_FMT "\n"
+		"%s\n\n"
+		COLORIZE_FMT "\n"
 		"%s\n\n",
 		ast_term_color(COLOR_MAGENTA, 0), instance->name, ast_term_reset(),
 		COLORIZE(COLOR_MAGENTA, 0, "[Synopsis]"), synopsis,
+		COLORIZE(COLOR_MAGENTA, 0, "[Provided By]"), provided_by,
 		COLORIZE(COLOR_MAGENTA, 0, "[Since]"), since,
 		COLORIZE(COLOR_MAGENTA, 0, "[Description]"), description,
 		COLORIZE(COLOR_MAGENTA, 0, "[Syntax]"), syntax,
@@ -9645,7 +9670,7 @@ static void manager_set_defaults(void)
 
 static int __init_manager(int reload, int by_external_config)
 {
-	struct ast_config *ucfg = NULL, *cfg = NULL;
+	struct ast_config *cfg = NULL;
 	const char *val;
 	char *cat = NULL;
 	int newhttptimeout = 60;
@@ -9879,100 +9904,6 @@ static int __init_manager(int reload, int by_external_config)
 	}
 
 	AST_RWLIST_WRLOCK(&users);
-
-	/* First, get users from users.conf */
-	ucfg = ast_config_load2("users.conf", "manager", config_flags);
-	if (ucfg && (ucfg != CONFIG_STATUS_FILEUNCHANGED) && ucfg != CONFIG_STATUS_FILEINVALID) {
-		const char *hasmanager;
-		int genhasmanager = ast_true(ast_variable_retrieve(ucfg, "general", "hasmanager"));
-
-		while ((cat = ast_category_browse(ucfg, cat))) {
-			if (!strcasecmp(cat, "general")) {
-				continue;
-			}
-
-			hasmanager = ast_variable_retrieve(ucfg, cat, "hasmanager");
-			if ((!hasmanager && genhasmanager) || ast_true(hasmanager)) {
-				const char *user_secret = ast_variable_retrieve(ucfg, cat, "secret");
-				const char *user_read = ast_variable_retrieve(ucfg, cat, "read");
-				const char *user_write = ast_variable_retrieve(ucfg, cat, "write");
-				const char *user_displayconnects = ast_variable_retrieve(ucfg, cat, "displayconnects");
-				const char *user_allowmultiplelogin = ast_variable_retrieve(ucfg, cat, "allowmultiplelogin");
-				const char *user_writetimeout = ast_variable_retrieve(ucfg, cat, "writetimeout");
-
-				/* Look for an existing entry,
-				 * if none found - create one and add it to the list
-				 */
-				if (!(user = get_manager_by_name_locked(cat))) {
-					if (!(user = ast_calloc(1, sizeof(*user)))) {
-						break;
-					}
-
-					/* Copy name over */
-					ast_copy_string(user->username, cat, sizeof(user->username));
-					/* Insert into list */
-					AST_LIST_INSERT_TAIL(&users, user, list);
-					user->acl = NULL;
-					user->keep = 1;
-					user->readperm = -1;
-					user->writeperm = -1;
-					/* Default displayconnect from [general] */
-					user->displayconnects = displayconnects;
-					/* Default allowmultiplelogin from [general] */
-					user->allowmultiplelogin = allowmultiplelogin;
-					user->writetimeout = 100;
-				}
-
-				if (!user_secret) {
-					user_secret = ast_variable_retrieve(ucfg, "general", "secret");
-				}
-				if (!user_read) {
-					user_read = ast_variable_retrieve(ucfg, "general", "read");
-				}
-				if (!user_write) {
-					user_write = ast_variable_retrieve(ucfg, "general", "write");
-				}
-				if (!user_displayconnects) {
-					user_displayconnects = ast_variable_retrieve(ucfg, "general", "displayconnects");
-				}
-				if (!user_allowmultiplelogin) {
-					user_allowmultiplelogin = ast_variable_retrieve(ucfg, "general", "allowmultiplelogin");
-				}
-				if (!user_writetimeout) {
-					user_writetimeout = ast_variable_retrieve(ucfg, "general", "writetimeout");
-				}
-
-				if (!ast_strlen_zero(user_secret)) {
-					ast_free(user->secret);
-					user->secret = ast_strdup(user_secret);
-				}
-
-				if (user_read) {
-					user->readperm = get_perm(user_read);
-				}
-				if (user_write) {
-					user->writeperm = get_perm(user_write);
-				}
-				if (user_displayconnects) {
-					user->displayconnects = ast_true(user_displayconnects);
-				}
-				if (user_allowmultiplelogin) {
-					user->allowmultiplelogin = ast_true(user_allowmultiplelogin);
-				}
-				if (user_writetimeout) {
-					int value = atoi(user_writetimeout);
-					if (value < 100) {
-						ast_log(LOG_WARNING, "Invalid writetimeout value '%d' in users.conf\n", value);
-					} else {
-						user->writetimeout = value;
-					}
-				}
-			}
-		}
-		ast_config_destroy(ucfg);
-	}
-
-	/* cat is NULL here in any case */
 
 	while ((cat = ast_category_browse(cfg, cat))) {
 		struct ast_acl_list *oldacl;

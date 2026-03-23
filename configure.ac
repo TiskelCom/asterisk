@@ -303,7 +303,7 @@ AC_PATH_PROG([BZIP2], [bzip2], :)
 AC_PATH_PROG([TAR], [tar], :)
 AC_PATH_PROG([PATCH], [patch], :)
 AC_PATH_PROG([SED], [sed], :)
-AC_PATH_PROG([NM], [nm], :)
+AC_PATH_TOOL([NM], [nm], :)
 AC_PATH_PROG([REALPATH], [realpath], :)
 
 
@@ -1248,6 +1248,19 @@ AC_RUN_IFELSE(
 	AC_MSG_RESULT(cross-compile)
 )
 
+AC_MSG_CHECKING([if setsockopt() accepts the IPV6_V6ONLY socket option])
+AC_COMPILE_IFELSE(
+[AC_LANG_PROGRAM([
+	   #include <sys/socket.h>
+	   #include <netinet/in.h>
+	], [
+	   int opt = IPV6_V6ONLY;
+	])],
+        AC_MSG_RESULT(yes)
+        AC_DEFINE(HAVE_SOCK_IPV6_V6ONLY, 1, [Define to 1 if your socket() implementation has the IPV6_V6ONLY socket option.]),
+	AC_MSG_RESULT(no)
+)
+
 AC_MSG_CHECKING(if we can increase the maximum select-able file descriptor)
 AC_RUN_IFELSE(
 [AC_LANG_PROGRAM([
@@ -1586,6 +1599,8 @@ AC_SUBST(BIND8_CFLAGS)
 AST_C_DEFINE_CHECK([GLOB_NOMAGIC], [GLOB_NOMAGIC], [glob.h])
 
 AST_C_DEFINE_CHECK([GLOB_BRACE], [GLOB_BRACE], [glob.h])
+
+AST_C_DEFINE_CHECK([FNM_CASEFOLD], [FNM_CASEFOLD], [fnmatch.h])
 
 AST_C_DEFINE_CHECK([RTLD_NOLOAD], [RTLD_NOLOAD], [dlfcn.h])
 

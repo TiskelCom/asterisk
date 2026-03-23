@@ -35,7 +35,8 @@
 #include "asterisk/cli.h"
 #include "asterisk/stasis_system.h"
 #include "asterisk/threadstorage.h"
-#include "asterisk/threadpool.h"
+#include "asterisk/taskpool.h"
+#include "asterisk/serializer_shutdown_group.h"
 #include "asterisk/statsd.h"
 #include "res_pjsip/include/res_pjsip_private.h"
 #include "asterisk/vector.h"
@@ -1669,7 +1670,7 @@ static void sip_outbound_registration_response_cb(struct pjsip_regc_cbparam *par
 	 * pjproject callback thread.
 	 */
 	if (ast_sip_push_task(client_state->serializer, handle_registration_response, response)) {
-		ast_log(LOG_WARNING, "Failed to pass incoming registration response to threadpool\n");
+		ast_log(LOG_WARNING, "Failed to pass incoming registration response to taskpool\n");
 		ao2_cleanup(response);
 	}
 }
@@ -1690,7 +1691,7 @@ static void sip_outbound_registration_state_destroy(void *obj)
 		ao2_ref(state->client_state, -1);
 	} else if (ast_sip_push_task(state->client_state->serializer,
 		handle_client_state_destruction, state->client_state)) {
-		ast_log(LOG_WARNING, "Failed to pass outbound registration client destruction to threadpool\n");
+		ast_log(LOG_WARNING, "Failed to pass outbound registration client destruction to taskpool\n");
 		ao2_ref(state->client_state, -1);
 	}
 }
@@ -2951,6 +2952,12 @@ static int load_module(void)
 		return AST_MODULE_LOAD_DECLINE;
 	}
 
+	/* Because we delegate to unload_module() in our error paths, everything we do here
+	   has to be idempotent. Due to the way we define our CLI handlers (specifically
+	   setting the `command` and `usage` members to statically allocated strings) we
+	   _must_ register them for them to later be safely unregistered. */
+	ast_cli_register_multiple(cli_outbound_registration, ARRAY_LEN(cli_outbound_registration));
+
 	/* Create outbound registration states container. */
 	new_states = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0,
 		DEFAULT_STATE_BUCKETS, registration_state_hash, NULL, registration_state_cmp);
@@ -3028,7 +3035,6 @@ static int load_module(void)
 	cli_formatter->get_id = ast_sorcery_object_get_id;
 	cli_formatter->retrieve_by_id = cli_retrieve_by_id;
 	ast_sip_register_cli_formatter(cli_formatter);
-	ast_cli_register_multiple(cli_outbound_registration, ARRAY_LEN(cli_outbound_registration));
 
 	/* Register AMI actions. */
 	ast_manager_register_xml("PJSIPUnregister", EVENT_FLAG_SYSTEM | EVENT_FLAG_REPORTING, ami_unregister);

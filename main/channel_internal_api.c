@@ -304,6 +304,15 @@ void ast_channel_hangupcause_set(struct ast_channel *chan, int value)
 	chan->hangupcause = value;
 	ast_channel_snapshot_invalidate_segment(chan, AST_CHANNEL_SNAPSHOT_INVALIDATE_HANGUP);
 }
+int ast_channel_tech_hangupcause(const struct ast_channel *chan)
+{
+	return chan->tech_hangupcause;
+}
+void ast_channel_tech_hangupcause_set(struct ast_channel *chan, int value)
+{
+	chan->tech_hangupcause = value;
+	ast_channel_snapshot_invalidate_segment(chan, AST_CHANNEL_SNAPSHOT_INVALIDATE_HANGUP);
+}
 int ast_channel_priority(const struct ast_channel *chan)
 {
 	return chan->priority;
@@ -1130,6 +1139,11 @@ static int collect_names_cb(void *obj, void *arg, int flags)
 	return 0;
 }
 
+struct ao2_iterator ast_channel_dialed_causes_iterator(const struct ast_channel *chan)
+{
+	return ao2_iterator_init(chan->dialed_causes, 0);
+}
+
 struct ast_str *ast_channel_dialed_causes_channels(const struct ast_channel *chan)
 {
 	struct ast_str *chanlist = ast_str_create(128);
@@ -1355,6 +1369,15 @@ void ast_channel_internal_swap_snapshots(struct ast_channel *a, struct ast_chann
 	b->snapshot = snapshot;
 }
 
+void ast_channel_internal_swap_endpoints(struct ast_channel *a, struct ast_channel *b)
+{
+	struct ast_endpoint *endpoint;
+
+	endpoint = a->endpoint;
+	a->endpoint = b->endpoint;
+	b->endpoint = endpoint;
+}
+
 void ast_channel_internal_set_fake_ids(struct ast_channel *chan, const char *uniqueid, const char *linkedid)
 {
 	ast_copy_string(chan->uniqueid.unique_id, uniqueid, sizeof(chan->uniqueid.unique_id));
@@ -1552,4 +1575,23 @@ void ast_channel_snapshot_set(struct ast_channel *chan, struct ast_channel_snaps
 struct ast_flags *ast_channel_snapshot_segment_flags(struct ast_channel *chan)
 {
 	return &chan->snapshot_segment_flags;
+}
+
+struct ast_endpoint *ast_channel_endpoint(const struct ast_channel *chan)
+{
+	return chan->endpoint;
+}
+
+void ast_channel_endpoint_set(struct ast_channel *chan, struct ast_endpoint *endpoint)
+{
+	if (chan->endpoint) {
+		ast_endpoint_remove_channel(chan->endpoint, chan);
+		ao2_ref(chan->endpoint, -1);
+	}
+
+	chan->endpoint = ao2_bump(endpoint);
+
+	if (chan->endpoint) {
+		ast_endpoint_add_channel(chan->endpoint, chan);
+	}
 }

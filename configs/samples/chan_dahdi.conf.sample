@@ -570,6 +570,9 @@ context=public
 ;
 ; Whether or not to use caller ID:
 ;
+; On FXO ports, this enables detecting Caller ID on the incoming phone call.
+; On FXS ports, this enables sending a Caller ID spill to CPE.
+;
 usecallerid=yes
 ;
 ; NOTE: If the CALL_QUALIFIER variable on the channel is set to 1,
@@ -977,8 +980,8 @@ group=1
 ; If you need to pick up an FXS signalled channel directly, you can have it
 ; dial a Local channel and pick up the ;1 side of the Local channel instead.
 ;
-callgroup=1
-pickupgroup=1
+;callgroup=1
+;pickupgroup=1
 ;
 ; Named ring groups (a.k.a. named call groups) and named pickup groups.
 ; If a phone is ringing and it is a member of a group which is one of your
@@ -1777,7 +1780,7 @@ pickupgroup=1
 ; ~~~~~~~~~~~~~~~~~~~~~~
 ; You can also configure channels in a separate chan_dahdi.conf section. In
 ; this case the keyword 'channel' is not used. Instead the keyword
-; 'dahdichan' is used (as in users.conf) - configuration is only processed
+; 'dahdichan' is used - configuration is only processed
 ; in a section where the keyword dahdichan is used. It will only be
 ; processed in the end of the section. Thus the following section:
 ;
@@ -1795,8 +1798,7 @@ pickupgroup=1
 ;
 ; When starting a new section almost all of the configuration values are
 ; copied from their values at the end of the section [channels] in
-; chan_dahdi.conf and [general] in users.conf - one section's configuration
-; does not affect another one's.
+; chan_dahdi.conf - one section's configuration does not affect another one's.
 ;
 ; Instead of letting common configuration values "slide through" you can
 ; use configuration templates to easily keep the common part in one

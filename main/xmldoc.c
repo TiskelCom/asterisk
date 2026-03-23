@@ -94,7 +94,7 @@ static const struct strcolorized_tags {
 	{ "", "", COLOR_YELLOW, "<note>",   "</note>" },
 	{ "", "", COLOR_RED,   "<warning>", "</warning>" },
 	{ "", "", COLOR_WHITE, "<example>", "</example>" },
-	{ "", "", COLOR_GRAY, "<exampletext>", "</exampletext>"},
+	{ "", "", COLOR_WHITE, "<exampletext>", "</exampletext>"},
 };
 
 static const struct strspecial_tags {
@@ -1359,7 +1359,8 @@ static int xmldoc_parse_para(struct ast_xml_node *node, const char *tabs, const 
  * \retval 0 if no example node is parsed.
  * \retval 1 if an example node is parsed.
  */
-static int xmldoc_parse_example(struct ast_xml_node *fixnode, struct ast_str **buffer)
+static int xmldoc_parse_example(struct ast_xml_node *fixnode, const char *tabs,
+	struct ast_str **buffer)
 {
 	struct ast_xml_node *node = fixnode;
 	const char *tmptext;
@@ -1387,9 +1388,11 @@ static int xmldoc_parse_example(struct ast_xml_node *fixnode, struct ast_str **b
 	for (node = ast_xml_node_get_children(node); node; node = ast_xml_node_get_next(node)) {
 		tmptext = ast_xml_get_text(node);
 		if (tmptext) {
-			xmldoc_string_cleanup(tmptext, &stripped_text, 0, 1);
+			const char *skipped = ast_skip_blanks(tmptext);
+			xmldoc_string_cleanup(skipped, &stripped_text, 0, 1);
 			if (stripped_text) {
-				ast_str_append(buffer, 0, "<exampletext>%s</exampletext>\n", ast_str_buffer(stripped_text));
+				ast_str_append(buffer, 0, "\n %s<exampletext>%s</exampletext>\n",
+					tabs, ast_str_buffer(stripped_text));
 				ast_xml_free_text(tmptext);
 				ast_free(stripped_text);
 			}
@@ -1434,7 +1437,7 @@ static int xmldoc_parse_specialtags(struct ast_xml_node *fixnode, const char *ta
 			ast_str_append(buffer, 0, "%s%s", tabs, special_tags[i].init);
 		}
 
-		if (xmldoc_parse_example(node, buffer)) {
+		if (xmldoc_parse_example(node, tabs, buffer)) {
 			ret = 1;
 			break;
 		}
@@ -1495,7 +1498,9 @@ static int xmldoc_parse_argument(struct ast_xml_node *fixnode, int insideparamet
 	}
 
 	for (node = ast_xml_node_get_children(node); node; node = ast_xml_node_get_next(node)) {
-		if (xmldoc_parse_common_elements(node, (insideparameter ? paramtabs : (!count ? " - " : tabs)), "\n", buffer) == 2) {
+		int rc = 0;
+		rc = xmldoc_parse_common_elements(node, (insideparameter ? paramtabs : (!count ? " - " : tabs)), "\n", buffer);
+		if (rc >= 1) {
 			count++;
 			ret = 1;
 		}
@@ -1809,6 +1814,58 @@ char *ast_xmldoc_build_since(const char *type, const char *name, const char *mod
 
 /*!
  * \internal
+ * \brief Build provided-by information for an item
+ *
+ * \param node	The application, function, etc. node to parse
+ *
+ * \note This method exists for when you already have the node.  This
+ * prevents having to lock the documentation tree twice
+ *
+ * \retval A malloc'd character pointer to the provided-by information of the item
+ * \retval NULL on failure
+ *
+ * \note The value actually comes from the "module" attribute.
+ *
+ */
+static char *_ast_xmldoc_build_provided_by(struct ast_xml_node *node)
+{
+	const char *attr;
+	char *output;
+
+	attr = ast_xml_get_attribute(node, "module");
+	if (ast_strlen_zero(attr)) {
+		return NULL;
+	}
+	output = ast_strdup(attr);
+	ast_xml_free_attr(attr);
+	return output;
+}
+
+char *ast_xmldoc_build_provided_by(const char *type, const char *name, const char *module)
+{
+	char *output;
+	struct ast_xml_node *node;
+
+	if (ast_strlen_zero(type) || ast_strlen_zero(name)) {
+		return NULL;
+	}
+
+	/* get the application/function root node. */
+	AST_RWLIST_RDLOCK(&xmldoc_tree);
+	node = xmldoc_get_node(type, name, module, documentation_language);
+	if (!node || !ast_xml_node_get_children(node)) {
+		AST_RWLIST_UNLOCK(&xmldoc_tree);
+		return NULL;
+	}
+
+	output = _ast_xmldoc_build_provided_by(node);
+	AST_RWLIST_UNLOCK(&xmldoc_tree);
+
+	return output;
+}
+
+/*!
+ * \internal
  * \brief Parse a \<enum\> node.
  *
  * \param fixnode An ast_xml_node pointer to the \<enum\> node.
@@ -1902,19 +1959,19 @@ static int xmldoc_parse_option(struct ast_xml_node *fixnode, const char *tabs, s
 		return ret;
 	}
 	for (node = ast_xml_node_get_children(fixnode); node; node = ast_xml_node_get_next(node)) {
+		/* if this is the first data appended to buffer, print a \n */
+		if (!ret && ast_xml_node_get_children(node)) {
+			/* print \n */
+			ast_str_append(buffer, 0, "\n");
+		}
 		if (!strcasecmp(ast_xml_node_get_name(node), "argument")) {
-			/* if this is the first data appended to buffer, print a \n*/
-			if (!ret && ast_xml_node_get_children(node)) {
-				/* print \n */
-				ast_str_append(buffer, 0, "\n");
-			}
 			if (xmldoc_parse_argument(node, 0, NULL, optiontabs, buffer)) {
 				ret = 1;
 			}
 			continue;
 		}
 
-		if (xmldoc_parse_common_elements(node, (ret ? tabs :  ""), "\n", buffer)) {
+		if (xmldoc_parse_common_elements(node, optiontabs, "\n", buffer)) {
 			ret = 1;
 		}
 
@@ -2012,7 +2069,7 @@ static void xmldoc_parse_parameter(struct ast_xml_node *fixnode, const char *tab
 	}
 
 	if (!hasarguments && xmldoc_has_nodes(node)) {
-		ast_str_append(buffer, 0, "%s\n", paramname);
+		ast_str_append(buffer, 0, "\n%s\n", paramname);
 		ast_xml_free_attr(paramname);
 		printed = 1;
 	}
@@ -2075,6 +2132,7 @@ static void xmldoc_parse_parameter(struct ast_xml_node *fixnode, const char *tab
 static int xmldoc_parse_info(struct ast_xml_node *node, const char *tabs, const char *posttabs, struct ast_str **buffer)
 {
 	const char *tech;
+	const char *provided_by;
 	char *internaltabs;
 	int internal_ret;
 	int ret = 0;
@@ -2089,9 +2147,13 @@ static int xmldoc_parse_info(struct ast_xml_node *node, const char *tabs, const 
 	}
 
 	tech = ast_xml_get_attribute(node, "tech");
-	if (tech) {
-		ast_str_append(buffer, 0, "%s<note>Technology: %s</note>\n", internaltabs, tech);
+	provided_by = ast_xml_get_attribute(node, "module");
+
+	if (tech || provided_by) {
+		ast_str_append(buffer, 0, "%s<note>Technology: %s  Provided by: %s</note>\n", internaltabs,
+			S_OR(tech, "unknown"), S_OR(provided_by, "unknown"));
 		ast_xml_free_attr(tech);
+		ast_xml_free_attr(provided_by);
 	}
 
 	ret = 1;
@@ -2372,6 +2434,7 @@ static void ast_xml_doc_item_destructor(void *obj)
 	}
 
 	ast_free(doc->synopsis);
+	ast_free(doc->provided_by);
 	ast_free(doc->since);
 	ast_free(doc->description);
 	ast_free(doc->syntax);
@@ -2405,6 +2468,7 @@ static struct ast_xml_doc_item *ast_xml_doc_item_alloc(const char *name, const c
 	}
 
 	if (   !(item->synopsis = ast_str_create(128))
+		|| !(item->provided_by = ast_str_create(128))
 		|| !(item->since = ast_str_create(128))
 		|| !(item->description = ast_str_create(128))
 		|| !(item->syntax = ast_str_create(128))
@@ -2470,6 +2534,7 @@ static struct ast_xml_doc_item *xmldoc_build_documentation_item(struct ast_xml_n
 {
 	struct ast_xml_doc_item *item;
 	char *synopsis;
+	char *provided_by;
 	char *since;
 	char *description;
 	char *syntax;
@@ -2482,6 +2547,7 @@ static struct ast_xml_doc_item *xmldoc_build_documentation_item(struct ast_xml_n
 	item->node = node;
 
 	synopsis = _ast_xmldoc_build_synopsis(node);
+	provided_by = _ast_xmldoc_build_provided_by(node);
 	since = _ast_xmldoc_build_since(node);
 	description = _ast_xmldoc_build_description(node);
 	syntax = _ast_xmldoc_build_syntax(node, type, name);
@@ -2490,6 +2556,9 @@ static struct ast_xml_doc_item *xmldoc_build_documentation_item(struct ast_xml_n
 
 	if (synopsis) {
 		ast_str_set(&item->synopsis, 0, "%s", synopsis);
+	}
+	if (provided_by) {
+		ast_str_set(&item->provided_by, 0, "%s", provided_by);
 	}
 	if (since) {
 		ast_str_set(&item->since, 0, "%s", since);
@@ -2508,6 +2577,7 @@ static struct ast_xml_doc_item *xmldoc_build_documentation_item(struct ast_xml_n
 	}
 
 	ast_free(synopsis);
+	ast_free(provided_by);
 	ast_free(since);
 	ast_free(description);
 	ast_free(syntax);
@@ -2733,6 +2803,7 @@ int ast_xmldoc_regenerate_doc_item(struct ast_xml_doc_item *item)
 	char *seealso;
 	char *arguments;
 	char *synopsis;
+	char *provided_by;
 	char *description;
 
 	if (!item || !item->node) {
@@ -2748,6 +2819,7 @@ int ast_xmldoc_regenerate_doc_item(struct ast_xml_doc_item *item)
 	seealso = _ast_xmldoc_build_seealso(item->node);
 	arguments = _ast_xmldoc_build_arguments(item->node);
 	synopsis = _ast_xmldoc_build_synopsis(item->node);
+	provided_by = _ast_xmldoc_build_provided_by(item->node);
 	description = _ast_xmldoc_build_description(item->node);
 
 	if (syntax) {
@@ -2770,6 +2842,7 @@ int ast_xmldoc_regenerate_doc_item(struct ast_xml_doc_item *item)
 	ast_free(seealso);
 	ast_free(arguments);
 	ast_free(synopsis);
+	ast_free(provided_by);
 	ast_free(description);
 	ast_xml_free_attr(name);
 	return 0;

@@ -51,27 +51,21 @@
 #define MAX_PROTOCOL_BUCKETS 7
 
 #ifdef LOW_MEMORY
-/*! \brief Size of the pre-determined buffer for WebSocket frames */
-#define MAXIMUM_FRAME_SIZE 8192
-
 /*! \brief Default reconstruction size for multi-frame payload reconstruction. If exceeded the next frame will start a
  *         payload.
  */
-#define DEFAULT_RECONSTRUCTION_CEILING 8192
+#define DEFAULT_RECONSTRUCTION_CEILING AST_WEBSOCKET_MAX_RX_PAYLOAD_SIZE
 
 /*! \brief Maximum reconstruction size for multi-frame payload reconstruction. */
-#define MAXIMUM_RECONSTRUCTION_CEILING 8192
+#define MAXIMUM_RECONSTRUCTION_CEILING AST_WEBSOCKET_MAX_RX_PAYLOAD_SIZE
 #else
-/*! \brief Size of the pre-determined buffer for WebSocket frames */
-#define MAXIMUM_FRAME_SIZE 65535
-
 /*! \brief Default reconstruction size for multi-frame payload reconstruction. If exceeded the next frame will start a
  *         payload.
  */
-#define DEFAULT_RECONSTRUCTION_CEILING MAXIMUM_FRAME_SIZE
+#define DEFAULT_RECONSTRUCTION_CEILING AST_WEBSOCKET_MAX_RX_PAYLOAD_SIZE
 
 /*! \brief Maximum reconstruction size for multi-frame payload reconstruction. */
-#define MAXIMUM_RECONSTRUCTION_CEILING MAXIMUM_FRAME_SIZE
+#define MAXIMUM_RECONSTRUCTION_CEILING AST_WEBSOCKET_MAX_RX_PAYLOAD_SIZE
 #endif
 
 /*! \brief Maximum size of a websocket frame header
@@ -100,8 +94,30 @@ struct ast_websocket {
 	struct websocket_client *client;    /*!< Client object when connected as a client websocket */
 	char session_id[AST_UUID_STR_LEN];  /*!< The identifier for the websocket session */
 	uint16_t close_status_code;         /*!< Status code sent in a CLOSE frame upon shutdown */
-	char buf[MAXIMUM_FRAME_SIZE];	    /*!< Fixed buffer for reading data into */
+	char buf[AST_WEBSOCKET_MAX_RX_PAYLOAD_SIZE];	    /*!< Fixed buffer for reading data into */
 };
+
+const char *ast_websocket_type_to_str(enum ast_websocket_type type)
+{
+	switch (type) {
+	case AST_WS_TYPE_CLIENT_PERSISTENT:
+		return "persistent";
+	case AST_WS_TYPE_CLIENT_PER_CALL:
+		return "per_call";
+	case AST_WS_TYPE_CLIENT_PER_CALL_CONFIG:
+		return "per_call_config";
+	case AST_WS_TYPE_CLIENT:
+		return "client";
+	case AST_WS_TYPE_INBOUND:
+		return "inbound";
+	case AST_WS_TYPE_SERVER:
+		return "server";
+	case AST_WS_TYPE_ANY:
+		return "any";
+	default:
+		return "unknown";
+	}
+}
 
 /*! \brief Hashing function for protocols */
 static int protocol_hash_fn(const void *obj, const int flags)
@@ -179,7 +195,7 @@ static void session_destroy_fn(void *obj)
 		if (session->stream) {
 			ast_iostream_close(session->stream);
 			session->stream = NULL;
-			ast_verb(2, "WebSocket connection %s '%s' closed\n", session->client ? "to" : "from",
+			ast_debug(3, "WebSocket connection %s '%s' closed\n", session->client ? "to" : "from",
 				ast_sockaddr_stringify(&session->remote_address));
 		}
 	}
@@ -257,7 +273,7 @@ int AST_OPTIONAL_API_NAME(ast_websocket_server_add_protocol2)(struct ast_websock
 	ao2_link_flags(server->protocols, protocol, OBJ_NOLOCK);
 	ao2_unlock(server->protocols);
 
-	ast_verb(5, "WebSocket registered sub-protocol '%s'\n", protocol->name);
+	ast_debug(1, "WebSocket registered sub-protocol '%s'\n", protocol->name);
 	ao2_ref(protocol, -1);
 
 	return 0;
@@ -279,7 +295,7 @@ int AST_OPTIONAL_API_NAME(ast_websocket_server_remove_protocol)(struct ast_webso
 	ao2_unlink(server->protocols, protocol);
 	ao2_ref(protocol, -1);
 
-	ast_verb(5, "WebSocket unregistered sub-protocol '%s'\n", name);
+	ast_debug(1, "WebSocket unregistered sub-protocol '%s'\n", name);
 
 	return 0;
 }
@@ -650,7 +666,7 @@ int AST_OPTIONAL_API_NAME(ast_websocket_read)(struct ast_websocket *session, cha
 		/* Now read the rest of the payload */
 		*payload = &session->buf[frame_size]; /* payload will start here, at the end of the options, if any */
 		frame_size = frame_size + (*payload_len); /* final frame size is header + optional headers + payload data */
-		if (frame_size > MAXIMUM_FRAME_SIZE) {
+		if (frame_size > AST_WEBSOCKET_MAX_RX_PAYLOAD_SIZE) {
 			ast_log(LOG_WARNING, "Cannot fit huge websocket frame of %zu bytes\n", frame_size);
 			/* The frame won't fit :-( */
 			ast_websocket_close(session, 1009);
@@ -970,7 +986,7 @@ int AST_OPTIONAL_API_NAME(ast_websocket_uri_cb)(struct ast_tcptls_session_instan
 		return 0;
 	}
 
-	ast_verb(2, "WebSocket connection from '%s' for protocol '%s' accepted using version '%d'\n", ast_sockaddr_stringify(&ser->remote_address), protocol ? : "", version);
+	ast_debug(3, "WebSocket connection from '%s' for protocol '%s' accepted using version '%d'\n", ast_sockaddr_stringify(&ser->remote_address), protocol ? : "", version);
 
 	/* Populate the session with all the needed details */
 	session->stream = ser->stream;
@@ -1614,6 +1630,43 @@ const char *AST_OPTIONAL_API_NAME(ast_websocket_result_to_str)
 		return "unknown";
 	}
 	return websocket_result_string_map[result];
+}
+
+struct status_map {
+	enum ast_websocket_status_code code;
+	const char *desc;
+};
+
+static const struct status_map websocket_status_map[] = {
+	{ AST_WEBSOCKET_STATUS_NORMAL, "Normal" },
+	{ AST_WEBSOCKET_STATUS_GOING_AWAY, "Going away" },
+	{ AST_WEBSOCKET_STATUS_PROTOCOL_ERROR, "Protocol error" },
+	{ AST_WEBSOCKET_STATUS_UNSUPPORTED_DATA, "Unsupported data" },
+	{ AST_WEBSOCKET_STATUS_RESERVED_1004, "reserved 1004" },
+	{ AST_WEBSOCKET_STATUS_RESERVED_1005, "reserved 1005" },
+	{ AST_WEBSOCKET_STATUS_RESERVED_1006, "reserved 1006" },
+	{ AST_WEBSOCKET_STATUS_INVALID_FRAME, "Invalid frame" },
+	{ AST_WEBSOCKET_STATUS_POLICY_VIOLATION, "Policy violation" },
+	{ AST_WEBSOCKET_STATUS_TOO_BIG, "Data too big" },
+	{ AST_WEBSOCKET_STATUS_MANDATORY_EXT, "Mandatory extension" },
+	{ AST_WEBSOCKET_STATUS_INTERNAL_ERROR, "Internal error" },
+	{ AST_WEBSOCKET_STATUS_RESERVED_1012, "reserved 1012" },
+	{ AST_WEBSOCKET_STATUS_RESERVED_1013, "reserved 1013" },
+	{ AST_WEBSOCKET_STATUS_BAD_GATEWAY, "Bad gateway" },
+	{ AST_WEBSOCKET_STATUS_RESERVED_1015, "reserved 1015" },
+};
+
+const char *AST_OPTIONAL_API_NAME(ast_websocket_status_to_str)
+	(enum ast_websocket_status_code code)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_LEN(websocket_status_map); i++) {
+		if (websocket_status_map[i].code == code)
+			return websocket_status_map[i].desc;
+	}
+
+	return "Unknown";
 }
 
 static int load_module(void)

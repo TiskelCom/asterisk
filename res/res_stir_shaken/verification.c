@@ -127,7 +127,7 @@ static int add_cert_expiration_to_astdb(struct ast_stir_shaken_vs_ctx *cert,
 	config_expires = current_time + cfg->vcfg_common.max_cache_entry_age;
 
 	if (!ast_strlen_zero(cache_control_header)) {
-		char *str_max_age;
+		const char *str_max_age;
 
 		str_max_age = strstr(cache_control_header, "s-maxage");
 		if (!str_max_age) {
@@ -136,7 +136,7 @@ static int add_cert_expiration_to_astdb(struct ast_stir_shaken_vs_ctx *cert,
 
 		if (str_max_age) {
 			unsigned int m;
-			char *equal = strchr(str_max_age, '=');
+			const char *equal = strchr(str_max_age, '=');
 			if (equal && !ast_str_to_uint(equal + 1, &m)) {
 				max_age_hdr = current_time + m;
 			}
@@ -345,7 +345,8 @@ static enum ast_stir_shaken_vs_response_code check_cert(
 	}
 
 	ast_trace(3,"%s: Checking ctx against CA ctx\n", ctx->tag);
-	res = crypto_is_cert_trusted(ctx->eprofile->vcfg_common.tcs, ctx->xcert, &err_msg);
+	res = crypto_is_cert_trusted(ctx->eprofile->vcfg_common.tcs, ctx->xcert,
+		ctx->cert_chain, &err_msg);
 	if (!res) {
 		SCOPE_EXIT_LOG_RTN_VALUE(AST_STIR_SHAKEN_VS_CERT_NOT_TRUSTED,
 			LOG_ERROR, "%s: Cert '%s' not trusted: %s\n",
@@ -429,8 +430,8 @@ static enum ast_stir_shaken_vs_response_code retrieve_cert_from_url(
 			ctx->tag, ctx->public_url);
 	}
 
-	ctx->xcert = crypto_load_cert_from_memory(write_data->stream_buffer,
-		write_data->stream_bytes_downloaded);
+	ctx->xcert = crypto_load_cert_chain_from_memory(write_data->stream_buffer,
+		write_data->stream_bytes_downloaded, &ctx->cert_chain);
 	if (!ctx->xcert) {
 		SCOPE_EXIT_LOG_RTN_VALUE(AST_STIR_SHAKEN_VS_CERT_CONTENTS_INVALID,
 			LOG_ERROR, "%s: Cert '%s' was not parseable as an X509 certificate\n",
@@ -524,7 +525,7 @@ static enum ast_stir_shaken_vs_response_code
 			ctx->tag, ctx->filename, ctx->public_url);
 	}
 
-	ctx->xcert = crypto_load_cert_from_file(ctx->filename);
+	ctx->xcert = crypto_load_cert_chain_from_file(ctx->filename, &ctx->cert_chain);
 	if (!ctx->xcert) {
 		cleanup_cert_from_astdb_and_fs(ctx);
 		SCOPE_EXIT_RTN_VALUE(AST_STIR_SHAKEN_VS_CERT_CONTENTS_INVALID,
@@ -651,6 +652,7 @@ static void ctx_destructor(void *obj)
 	ast_free(ctx->raw_key);
 	ast_string_field_free_memory(ctx);
 	X509_free(ctx->xcert);
+	sk_X509_free(ctx->cert_chain);
 }
 
 enum ast_stir_shaken_vs_response_code
@@ -732,6 +734,15 @@ static enum ast_stir_shaken_vs_response_code check_date_header(
 	int64_t time_diff;
 	SCOPE_ENTER(3, "%s: Checking date header: '%s'\n",
 		ctx->tag, ctx->date_hdr);
+
+	if (ast_strlen_zero(ctx->date_hdr)) {
+		if (ctx->eprofile->vcfg_common.ignore_sip_date_header) {
+			SCOPE_EXIT_RTN_VALUE(AST_STIR_SHAKEN_VS_SUCCESS,
+				"%s: ignore_sip_date_header set\n", ctx->tag);
+		}
+		SCOPE_EXIT_LOG_RTN_VALUE(AST_STIR_SHAKEN_VS_NO_DATE_HDR,
+			LOG_ERROR, "%s: No date header provided\n", ctx->tag);
+	}
 
 	if (!(remainder = ast_strptime(ctx->date_hdr, "%a, %d %b %Y %T", &date_hdr_tm))) {
 		SCOPE_EXIT_LOG_RTN_VALUE(AST_STIR_SHAKEN_VS_DATE_HDR_PARSE_FAILURE,
@@ -853,7 +864,7 @@ static int check_x5u_url(struct ast_stir_shaken_vs_ctx * ctx,
 		}
 		if (!ast_strlen_zero(port)) {
 			if (!ast_strings_equal(port, "443")
-				|| !ast_strings_equal(port, "8443")) {
+				&& !ast_strings_equal(port, "8443")) {
 				DUMP_X5U_MATCH();
 				SCOPE_EXIT_LOG_RTN_VALUE(AST_STIR_SHAKEN_VS_INVALID_OR_NO_X5U, LOG_ERROR,
 					"%s: x5u '%s': port '%s' not port 443 or 8443\n",
@@ -886,7 +897,7 @@ enum ast_stir_shaken_vs_response_code
 	RAII_VAR(char *, jwt_encoded, NULL, ast_free);
 	RAII_VAR(jwt_t *, jwt, NULL, jwt_free);
 	RAII_VAR(struct ast_json *, grants, NULL, ast_json_unref);
-	char *p = NULL;
+	const char *p = NULL;
 	char *grants_str = NULL;
 	const char *x5u;
 	const char *ppt_header = NULL;
@@ -910,6 +921,11 @@ enum ast_stir_shaken_vs_response_code
 	}
 
 	p = strchr(ctx->identity_hdr, ';');
+	if (ast_strlen_zero(p)) {
+		SCOPE_EXIT_LOG_RTN_VALUE(AST_STIR_SHAKEN_VS_INVALID_HEADER,
+			LOG_ERROR, "%s: Malformed identity header\n", ctx->tag);
+	}
+
 	len = p - ctx->identity_hdr + 1;
 	jwt_encoded = ast_malloc(len);
 	if (!jwt_encoded) {
@@ -920,7 +936,11 @@ enum ast_stir_shaken_vs_response_code
 	memcpy(jwt_encoded, ctx->identity_hdr, len);
 	jwt_encoded[len - 1] = '\0';
 
-	jwt_decode(&jwt, jwt_encoded, NULL, 0);
+	rc = jwt_decode(&jwt, jwt_encoded, NULL, 0);
+	if (rc != 0) {
+		SCOPE_EXIT_RTN_VALUE(AST_STIR_SHAKEN_VS_INVALID_HEADER, "%s: %s\n",
+			ctx->tag, vs_response_code_to_str(AST_STIR_SHAKEN_VS_INVALID_HEADER));
+	}
 
 	ppt_header = jwt_get_header(jwt, "ppt");
 	if (!ppt_header || strcmp(ppt_header, STIR_SHAKEN_PPT)) {
@@ -940,8 +960,8 @@ enum ast_stir_shaken_vs_response_code
 			"%s: No x5u in Identity header\n", ctx->tag);
 	}
 
-	rc = check_x5u_url(ctx, x5u);
-	if (rc != AST_STIR_SHAKEN_VS_SUCCESS) {
+	vs_rc = check_x5u_url(ctx, x5u);
+	if (vs_rc != AST_STIR_SHAKEN_VS_SUCCESS) {
 		SCOPE_EXIT_RTN_VALUE(vs_rc,
 			"%s: x5u URL verification failed\n", ctx->tag);
 	}
@@ -957,8 +977,9 @@ enum ast_stir_shaken_vs_response_code
 		SCOPE_EXIT_LOG_RTN_VALUE(AST_STIR_SHAKEN_VS_NO_IAT, LOG_ERROR,
 			"%s: No 'iat' in Identity header\n", ctx->tag);
 	}
-	ast_trace(1, "date_hdr: %zu  iat: %zu  diff: %zu\n",
-		ctx->date_hdr_time, iat, ctx->date_hdr_time - iat);
+	ast_trace(1, "date_hdr: %zu  iat: %zu\n",
+		ctx->date_hdr_time, iat);
+
 	if (iat + ctx->eprofile->vcfg_common.max_iat_age < now_s) {
 		SCOPE_EXIT_RTN_VALUE(AST_STIR_SHAKEN_VS_IAT_EXPIRED,
 			"%s: iat %ld older than %u seconds\n", ctx->tag,

@@ -3267,6 +3267,18 @@ static int __rtp_recvfrom(struct ast_rtp_instance *instance, void *buf, size_t s
 
 		ast_debug_dtls(3, "(%p) DTLS - __rtp_recvfrom rtp=%p - Got SSL packet '%d'\n", instance, rtp, *in);
 
+#ifdef HAVE_PJPROJECT
+		/* If this packet arrived via TURN/ICE loopback re-injection,
+		 * substitute the real remote address before the candidate check
+		 * otherwise the DTLS check will see 127.0.0.1 and drop the packet.
+		 */
+		if (!ast_sockaddr_isnull(&rtp->rtp_loop) && !ast_sockaddr_cmp(&rtp->rtp_loop, sa)) {
+			ast_rtp_instance_get_remote_address(instance, sa);
+		} else if (rtcp && !ast_sockaddr_isnull(&rtp->rtcp_loop) && !ast_sockaddr_cmp(&rtp->rtcp_loop, sa)) {
+			ast_sockaddr_copy(sa, &rtp->rtcp->them);
+		}
+#endif
+
 		/*
 		 * If ICE is in use, we can prevent a possible DOS attack
 		 * by allowing DTLS protocol messages (client hello, etc)
@@ -3451,6 +3463,16 @@ static int __rtp_sendto(struct ast_rtp_instance *instance, void *buf, size_t siz
 	struct ast_rtp *transport_rtp = ast_rtp_instance_get_data(transport);
 	struct ast_srtp *srtp = ast_rtp_instance_get_srtp(transport, rtcp);
 	int res;
+#if defined(HAVE_OPENSSL) && (OPENSSL_VERSION_NUMBER >= 0x10001000L) && !defined(OPENSSL_NO_SRTP)
+	char *out = buf;
+	struct dtls_details *dtls = (!rtcp || rtp->rtcp->type == AST_RTP_INSTANCE_RTCP_MUX) ? &rtp->dtls : &rtp->rtcp->dtls;
+
+	/* Don't send RTP if DTLS hasn't finished yet */
+	if (dtls->ssl && ((*out < 20) || (*out > 63)) && dtls->connection == AST_RTP_DTLS_CONNECTION_NEW) {
+		*via_ice = 0;
+		return 0;
+	}
+#endif
 
 	*via_ice = 0;
 
@@ -3555,9 +3577,13 @@ static void calc_mean_and_standard_deviation(double new_sample, double *mean, do
 	*std_dev = sqrt((last_sum_of_squares + (delta1 * delta2)) / *count);
 }
 
-static int create_new_socket(const char *type, int af)
+static int create_new_socket(const char *type, struct ast_sockaddr *bind_addr)
 {
-	int sock = ast_socket_nonblock(af, SOCK_DGRAM, 0);
+	int af, sock;
+
+	af = ast_sockaddr_is_ipv4(bind_addr) ? AF_INET  :
+	     ast_sockaddr_is_ipv6(bind_addr) ? AF_INET6 : -1;
+	sock = ast_socket_nonblock(af, SOCK_DGRAM, 0);
 
 	if (sock < 0) {
 		ast_log(LOG_WARNING, "Unable to allocate %s socket: %s\n", type, strerror(errno));
@@ -3567,6 +3593,15 @@ static int create_new_socket(const char *type, int af)
 #ifdef SO_NO_CHECK
 	if (nochecksums) {
 		setsockopt(sock, SOL_SOCKET, SO_NO_CHECK, &nochecksums, sizeof(nochecksums));
+	}
+#endif
+
+#ifdef HAVE_SOCK_IPV6_V6ONLY
+	if (AF_INET6 == af && ast_sockaddr_is_any(bind_addr)) {
+		/* ICE relies on dual-stack behavior. Ensure it is enabled. */
+		if (setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, &(int){0}, sizeof(int)) != 0) {
+			ast_log(LOG_WARNING, "setsockopt IPV6_V6ONLY=0 failed: %s\n", strerror(errno));
+		}
 	}
 #endif
 
@@ -4031,10 +4066,7 @@ static int rtp_allocate_transport(struct ast_rtp_instance *instance, struct ast_
 	rtp->strict_rtp_state = (strictrtp ? STRICT_RTP_CLOSED : STRICT_RTP_OPEN);
 
 	/* Create a new socket for us to listen on and use */
-	if ((rtp->s =
-	     create_new_socket("RTP",
-			       ast_sockaddr_is_ipv4(&rtp->bind_address) ? AF_INET  :
-			       ast_sockaddr_is_ipv6(&rtp->bind_address) ? AF_INET6 : -1)) < 0) {
+	if ((rtp->s = create_new_socket("RTP", &rtp->bind_address)) < 0) {
 		ast_log(LOG_WARNING, "Failed to create a new socket for RTP instance '%p'\n", instance);
 		return -1;
 	}
@@ -4371,15 +4403,19 @@ static int ast_rtp_dtmf_begin(struct ast_rtp_instance *instance, char digit)
 		return -1;
 	}
 
+
+	/* g722 is a 16K codec that masquerades as an 8K codec within RTP. ast_rtp_get_rate was written specifically to
+	   handle this. If we use the actual sample rate of g722 in this scenario and there is a 16K telephone-event on
+	   offer, we will end up using that instead of the 8K rate telephone-event that is expected with g722. */
 	if (rtp->lasttxformat == ast_format_none) {
 		/* No audio frames have been written yet so we have to lookup both the preferred payload type and bitrate. */
 		payload_format = ast_rtp_codecs_get_preferred_format(ast_rtp_instance_get_codecs(instance));
 		if (payload_format) {
 			/* If we have a preferred type, use that. Otherwise default to 8K. */
-			sample_rate = ast_format_get_sample_rate(payload_format);
+			sample_rate = ast_rtp_get_rate(payload_format);
 		}
 	} else {
-		sample_rate = ast_format_get_sample_rate(rtp->lasttxformat);
+		sample_rate = ast_rtp_get_rate(rtp->lasttxformat);
 	}
 
 	if (sample_rate != -1) {
@@ -8928,12 +8964,7 @@ static void ast_rtp_prop_set(struct ast_rtp_instance *instance, enum ast_rtp_pro
 				 * switching from MUX. Either way, we won't have
 				 * a socket set up, and we need to set it up
 				 */
-				if ((rtp->rtcp->s =
-				     create_new_socket("RTCP",
-						       ast_sockaddr_is_ipv4(&rtp->rtcp->us) ?
-						       AF_INET :
-						       ast_sockaddr_is_ipv6(&rtp->rtcp->us) ?
-						       AF_INET6 : -1)) < 0) {
+				if ((rtp->rtcp->s = create_new_socket("RTCP", &rtp->rtcp->us)) < 0) {
 					ast_debug_rtcp(1, "(%p) RTCP failed to create a new socket\n", instance);
 					ast_free(rtp->rtcp->local_addr_str);
 					ast_free(rtp->rtcp);
@@ -10193,7 +10224,7 @@ static int rtp_reload(int reload, int by_external_config)
 			continue;
 		}
 
-		sep = strchr(var->value,',');
+		sep = strchr((char *)var->value,',');
 		if (sep) {
 			*sep = '\0';
 			sep++;

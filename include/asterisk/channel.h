@@ -2848,6 +2848,16 @@ void ast_channel_internal_swap_endpoint_forward(struct ast_channel *a, struct as
 void ast_channel_internal_swap_snapshots(struct ast_channel *a, struct ast_channel *b);
 
 /*!
+ * \brief Swap endpoints between two channels
+ * \param a First channel
+ * \param b Second channel
+ *
+ * \note
+ * This is used in masquerade to exchange endpoints
+ */
+void ast_channel_internal_swap_endpoints(struct ast_channel *a, struct ast_channel *b);
+
+/*!
  * \brief Set uniqueid and linkedid string value only (not time)
  * \param chan The channel to set the uniqueid to
  * \param uniqueid The uniqueid to set
@@ -3986,10 +3996,13 @@ int ast_channel_redirecting_sub(struct ast_channel *autoservice_chan, struct ast
  * This function makes use of datastore operations on the channel, so
  * it is important to lock the channel before calling this function.
  *
+ * \warning You should call this function only if \ref ast_cc_is_enabled()
+ * returns true.
+ *
  * \param chan The channel to create the datastore on
  * \param base_params CCSS parameters we wish to copy into the channel
  * \retval 0 Success
- * \retval -1 Failure
+ * \retval -1 Failure or CCSS is globally disabled.
  */
 int ast_channel_cc_params_init(struct ast_channel *chan,
 		const struct ast_cc_config_params *base_params);
@@ -4002,8 +4015,11 @@ int ast_channel_cc_params_init(struct ast_channel *chan,
  * This function makes use of datastore operations on the channel, so
  * it is important to lock the channel before calling this function.
  *
+ * \warning You should call this function only if \ref ast_cc_is_enabled()
+ * returns true.
+ *
  * \param chan Channel to retrieve parameters from
- * \retval NULL Failure
+ * \retval NULL Failure or CCSS is globally disabled.
  * \retval non-NULL The parameters desired
  */
 struct ast_cc_config_params *ast_channel_get_cc_config_params(struct ast_channel *chan);
@@ -4187,6 +4203,8 @@ int ast_channel_fdno(const struct ast_channel *chan);
 void ast_channel_fdno_set(struct ast_channel *chan, int value);
 int ast_channel_hangupcause(const struct ast_channel *chan);
 void ast_channel_hangupcause_set(struct ast_channel *chan, int value);
+int ast_channel_tech_hangupcause(const struct ast_channel *chan);
+void ast_channel_tech_hangupcause_set(struct ast_channel *chan, int value);
 int ast_channel_priority(const struct ast_channel *chan);
 void ast_channel_priority_set(struct ast_channel *chan, int value);
 int ast_channel_rings(const struct ast_channel *chan);
@@ -4262,6 +4280,8 @@ ast_callid ast_channel_callid(const struct ast_channel *chan);
 struct ast_channel_snapshot *ast_channel_snapshot(const struct ast_channel *chan);
 void ast_channel_snapshot_set(struct ast_channel *chan, struct ast_channel_snapshot *snapshot);
 struct ast_flags *ast_channel_snapshot_segment_flags(struct ast_channel *chan);
+struct ast_endpoint *ast_channel_endpoint(const struct ast_channel *chan);
+void ast_channel_endpoint_set(struct ast_channel *chan, struct ast_endpoint *endpoint);
 
 /*!
  * \pre chan is locked
@@ -4427,6 +4447,26 @@ void ast_channel_internal_bridged_channel_set(struct ast_channel *chan, struct a
  * \retval Pointer to an ast_str object containing the desired information which must be freed
  */
 struct ast_str *ast_channel_dialed_causes_channels(const struct ast_channel *chan);
+
+/*!
+ * \since 20.19.0
+ * \since 22.9.0
+ * \since 23.3.0
+ * \brief Retrieve an iterator for dialed cause information
+ *
+ * \details
+ * Each call to ao2_iterator_next() will return a pointer to an ast_control_pvt_cause_code
+ * structure containing the dialed cause information for one channel.  One of the entries
+ * may be for the channel itself if the channel was hung up because of a non-2XX SIP
+ * response code. The rest of the entries will be for channels bridged to the channel for
+ * which dialed cause information is being retrieved.  The caller is responsible for
+ * cleaning up the reference count of each entry returned and destroying the returned
+ * iterator with ao2_iterator_destroy() when it is finished with it.
+ *
+ * \param chan The channel from which to retrieve cause information
+ * \retval ao2_iterator
+ */
+struct ao2_iterator ast_channel_dialed_causes_iterator(const struct ast_channel *chan);
 
 /*!
  * \since 11

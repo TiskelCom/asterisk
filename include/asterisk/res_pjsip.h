@@ -751,6 +751,16 @@ enum ast_sip_session_redirect {
 };
 
 /*!
+ * \brief SIP methods that are allowed to follow 3xx redirects.
+ *
+ * Used as bit flags in follow_redirect_methods field.
+ */
+enum ast_sip_redirect_method {
+	/*! Allow MESSAGE method to follow redirects */
+	AST_SIP_REDIRECT_METHOD_MESSAGE = (1 << 0),
+};
+
+/*!
  * \brief Incoming/Outgoing call offer/answer joint codec preference.
  *
  * The default is INTERSECT ALL LOCAL.
@@ -1114,6 +1124,8 @@ struct ast_sip_endpoint {
 	unsigned int allowtransfer;
 	/*! Method used when handling redirects */
 	enum ast_sip_session_redirect redirect_method;
+	/*! SIP methods allowed to follow 3xx redirects */
+	struct ast_flags follow_redirect_methods;
 	/*! Variables set on channel creation */
 	struct ast_variable *channel_vars;
 	/*! Whether to place a 'user=phone' parameter into the request URI if user is a number */
@@ -1921,7 +1933,7 @@ struct ast_sip_endpoint *ast_sip_get_artificial_endpoint(void);
  * There are three major types of threads that SIP will have to deal with:
  * \li Asterisk threads
  * \li PJSIP threads
- * \li SIP threadpool threads (a.k.a. "servants")
+ * \li SIP taskpool threads (a.k.a. "servants")
  *
  * \par Asterisk Threads
  *
@@ -1963,7 +1975,7 @@ struct ast_sip_endpoint *ast_sip_get_artificial_endpoint(void);
  * is NULL, then the work will be handed off to whatever servant can currently handle
  * the task. If this pointer is non-NULL, then the task will not be executed until
  * previous tasks pushed with the same serializer have completed. For more information
- * on serializers and the benefits they provide, see \ref ast_threadpool_serializer
+ * on serializers and the benefits they provide, see \ref ast_taskpool_serializer
  *
  * \par Scheduler
  *
@@ -1992,7 +2004,7 @@ typedef int (*ast_sip_task)(void *user_data);
  * \brief Create a new serializer for SIP tasks
  * \since 13.8.0
  *
- * See \ref ast_threadpool_serializer for more information on serializers.
+ * See \ref ast_taskpool_serializer for more information on serializers.
  * SIP creates serializers so that tasks operating on similar data will run
  * in sequence.
  *
@@ -2009,7 +2021,7 @@ struct ast_serializer_shutdown_group;
  * \brief Create a new serializer for SIP tasks
  * \since 13.8.0
  *
- * See \ref ast_threadpool_serializer for more information on serializers.
+ * See \ref ast_taskpool_serializer for more information on serializers.
  * SIP creates serializers so that tasks operating on similar data will run
  * in sequence.
  *
@@ -2076,7 +2088,11 @@ struct ast_sip_endpoint *ast_sip_dialog_get_endpoint(pjsip_dialog *dlg);
  * \retval 0 Success
  * \retval -1 Failure
  */
-int ast_sip_push_task(struct ast_taskprocessor *serializer, int (*sip_task)(void *), void *task_data);
+int __ast_sip_push_task(struct ast_taskprocessor *serializer, int (*sip_task)(void *), void *task_data,
+	const char *file, int line, const char *function);
+
+#define ast_sip_push_task(serializer, sip_task, task_data) \
+	__ast_sip_push_task(serializer, sip_task, task_data, __FILE__, __LINE__, __PRETTY_FUNCTION__)
 
 /*!
  * \brief Push a task to SIP servants and wait for it to complete.
@@ -2112,13 +2128,19 @@ int ast_sip_push_task(struct ast_taskprocessor *serializer, int (*sip_task)(void
  * \return sip_task() return value on success.
  * \retval -1 Failure to push the task.
  */
-int ast_sip_push_task_wait_servant(struct ast_taskprocessor *serializer, int (*sip_task)(void *), void *task_data);
+int __ast_sip_push_task_wait_servant(struct ast_taskprocessor *serializer, int (*sip_task)(void *), void *task_data,
+	const char *file, int line, const char *function);
+#define ast_sip_push_task_wait_servant(serializer, sip_task, task_data) \
+	__ast_sip_push_task_wait_servant(serializer, sip_task, task_data, __FILE__, __LINE__, __PRETTY_FUNCTION__)
 
 /*!
  * \brief Push a task to SIP servants and wait for it to complete.
  * \deprecated Replaced with ast_sip_push_task_wait_servant().
  */
-int ast_sip_push_task_synchronous(struct ast_taskprocessor *serializer, int (*sip_task)(void *), void *task_data);
+int __ast_sip_push_task_synchronous(struct ast_taskprocessor *serializer, int (*sip_task)(void *), void *task_data,
+	const char *file, int line, const char *function);
+#define ast_sip_push_task_synchronous(serializer, sip_task, task_data) \
+	__ast_sip_push_task_synchronous(serializer, sip_task, task_data, __FILE__, __LINE__, __PRETTY_FUNCTION__)
 
 /*!
  * \brief Push a task to the serializer and wait for it to complete.
@@ -2162,7 +2184,10 @@ int ast_sip_push_task_synchronous(struct ast_taskprocessor *serializer, int (*si
  * \return sip_task() return value on success.
  * \retval -1 Failure to push the task.
  */
-int ast_sip_push_task_wait_serializer(struct ast_taskprocessor *serializer, int (*sip_task)(void *), void *task_data);
+int __ast_sip_push_task_wait_serializer(struct ast_taskprocessor *serializer, int (*sip_task)(void *), void *task_data,
+	const char *file, int line, const char *function);
+#define ast_sip_push_task_wait_serializer(serializer, sip_task, task_data) \
+	__ast_sip_push_task_wait_serializer(serializer, sip_task, task_data, __FILE__, __LINE__, __PRETTY_FUNCTION__)
 
 /*!
  * \brief Determine if the current thread is a SIP servant thread
@@ -2251,7 +2276,7 @@ enum ast_sip_scheduler_task_flags {
 struct ast_sip_sched_task;
 
 /*!
- * \brief Schedule a task to run in the res_pjsip thread pool
+ * \brief Schedule a task to run in the res_pjsip taskpool
  * \since 13.9.0
  *
  * \param serializer The serializer to use.  If NULL, don't use a serializer (see note below)
@@ -2266,7 +2291,7 @@ struct ast_sip_sched_task;
  * \par Serialization
  *
  * Specifying a serializer guarantees serialized execution but NOT specifying a serializer
- * may still result in tasks being effectively serialized if the thread pool is busy.
+ * may still result in tasks being effectively serialized if the taskpool is busy.
  * The point of the serializer BTW is not to prevent parallel executions of the SAME task.
  * That happens automatically (see below).  It's to prevent the task from running at the same
  * time as other work using the same serializer, whether or not it's being run by the scheduler.
@@ -3662,15 +3687,15 @@ int ast_sip_get_host_ip(int af, pj_sockaddr *addr);
 const char *ast_sip_get_host_ip_string(int af);
 
 /*!
- * \brief Return the size of the SIP threadpool's task queue
+ * \brief Return the size of the SIP taskpool's task queue
  * \since 13.7.0
  */
-long ast_sip_threadpool_queue_size(void);
+long ast_sip_taskpool_queue_size(void);
 
 /*!
- * \brief Retrieve the SIP threadpool object
+ * \brief Retrieve the SIP taskpool object
  */
-struct ast_threadpool *ast_sip_threadpool(void);
+struct ast_taskpool *ast_sip_taskpool(void);
 
 /*!
  * \brief Retrieve transport state
@@ -4378,5 +4403,16 @@ const int ast_sip_hangup_sip2cause(int cause);
  * \retval -1 if matching code not found
  */
 int ast_sip_str2rc(const char *name);
+
+/*!
+ * \brief Parses a string representing a q_value to a float.
+ *
+ * Valid q values must be in the range from 0.0 to 1.0 inclusively.
+ *
+ * \param q_value String representing a floating point value
+ *
+ * \retval The parsed qvalue or -1.0 on failure.
+ */
+float ast_sip_parse_qvalue(const char *q_value);
 
 #endif /* _RES_PJSIP_H */

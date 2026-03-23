@@ -2942,11 +2942,17 @@ static int pbx_extension_helper(struct ast_channel *c, struct ast_context *con,
 				ast_log(LOG_WARNING, "No application '%s' for extension (%s, %s, %d)\n", e->app, context, exten, priority);
 				return -1;
 			}
+			ast_channel_lock(c);
+			if (ast_channel_softhangup_internal_flag(c) & AST_SOFTHANGUP_ASYNCGOTO) {
+				ast_channel_unlock(c);
+				return 0;
+			}
 			if (ast_channel_context(c) != context)
 				ast_channel_context_set(c, context);
 			if (ast_channel_exten(c) != exten)
 				ast_channel_exten_set(c, exten);
 			ast_channel_priority_set(c, priority);
+			ast_channel_unlock(c);
 			if (substitute) {
 				pbx_substitute_variables_helper(c, substitute, passdata, sizeof(passdata)-1);
 			}
@@ -4729,7 +4735,7 @@ enum ast_pbx_result ast_pbx_start(struct ast_channel *c)
 		return AST_PBX_FAILED;
 	}
 
-	if (!ast_test_flag(&ast_options, AST_OPT_FLAG_FULLY_BOOTED)) {
+	if (!ast_fully_booted) {
 		ast_log(LOG_WARNING, "PBX requires Asterisk to be fully booted\n");
 		return AST_PBX_FAILED;
 	}
@@ -4751,7 +4757,7 @@ enum ast_pbx_result ast_pbx_run_args(struct ast_channel *c, struct ast_pbx_args 
 {
 	enum ast_pbx_result res = AST_PBX_SUCCESS;
 
-	if (!ast_test_flag(&ast_options, AST_OPT_FLAG_FULLY_BOOTED)) {
+	if (!ast_fully_booted) {
 		ast_log(LOG_WARNING, "PBX requires Asterisk to be fully booted\n");
 		return AST_PBX_FAILED;
 	}
@@ -6608,6 +6614,10 @@ void ast_merge_contexts_and_delete(struct ast_context **extcontexts, struct ast_
 	/* Create all applicable autohint contexts */
 	context_table_create_autohints(contexts_table);
 
+	/* ctx_count is still the number of old contexts before the merge,
+	 * use the new count when we tell the user how many contexts exist. */
+	ctx_count = ast_hashtab_size(contexts_table);
+
 	ao2_unlock(hints);
 	ast_unlock_contexts();
 
@@ -6964,6 +6974,10 @@ int ast_explicit_goto(struct ast_channel *chan, const char *context, const char 
 
 	ast_channel_lock(chan);
 
+	if (ast_channel_softhangup_internal_flag(chan) & AST_SOFTHANGUP_ASYNCGOTO) {
+		ast_channel_unlock(chan);
+		return -1;
+	}
 	if (!ast_strlen_zero(context))
 		ast_channel_context_set(chan, context);
 	if (!ast_strlen_zero(exten))

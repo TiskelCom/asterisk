@@ -108,9 +108,13 @@ export XMLLINT
 export XMLSTARLET
 
 # makeopts is required unless the goal is just {dist{-}}clean
+# or module-list-{core,extended,deprecated}
 ifeq ($(MAKECMDGOALS),clean)
 else ifeq ($(MAKECMDGOALS),distclean)
 else ifeq ($(MAKECMDGOALS),dist-clean)
+else ifeq ($(MAKECMDGOALS),module-list-core)
+else ifeq ($(MAKECMDGOALS),module-list-extended)
+else ifeq ($(MAKECMDGOALS),module-list-deprecated)
 else
 include makeopts
 endif
@@ -285,7 +289,9 @@ MOD_SUBDIRS_MENUSELECT_TREE:=$(MOD_SUBDIRS:%=%-menuselect-tree)
 ifneq ($(findstring darwin,$(OSARCH)),)
   _ASTCFLAGS+=-D__Darwin__ -mmacosx-version-min=10.6
   _SOLINK=-mmacosx-version-min=10.6 -Wl,-undefined,dynamic_lookup
-  _SOLINK+=/usr/lib/bundle1.o
+  ifneq ($(wildcard /usr/lib/bundle1.o),)
+    _SOLINK+=/usr/lib/bundle1.o
+  endif
   SOLINK=-bundle $(_SOLINK)
   DYLINK=-Wl,-dylib $(_SOLINK)
   _ASTLDFLAGS+=-L/usr/local/lib
@@ -611,6 +617,13 @@ oldmodcheck:
 		echo "" ;\
 		echo " WARNING WARNING WARNING" ;\
 	fi
+
+# The module-list-* independent targets are for evaluation of the source tree
+# to show which modules are at which support levels, without configure/compile.
+module-list-core module-list-extended module-list-deprecated:
+	@s=$(subst module-list-,,$@) ;\
+	echo "Showing all modules at support level '$$s':" ;\
+	grep -l -r --include="*.c" --include="*.cc" --exclude-dir=tests --exclude-dir=utils "<support_level>$$s</support_level>" | sort
 
 ld-cache-update:
 ifeq ($(LDCONFIG),)

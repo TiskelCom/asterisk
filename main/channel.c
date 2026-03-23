@@ -42,6 +42,7 @@
 #include "asterisk/mod_format.h"
 #include "asterisk/sched.h"
 #include "asterisk/channel.h"
+#include "asterisk/cel.h"
 #include "asterisk/musiconhold.h"
 #include "asterisk/say.h"
 #include "asterisk/file.h"
@@ -74,6 +75,7 @@
 #include "asterisk/max_forwards.h"
 #include "asterisk/stream.h"
 #include "asterisk/message.h"
+#include "asterisk/rtp_engine.h"
 
 #include "channelstorage.h"
 
@@ -497,7 +499,7 @@ void ast_softhangup_all(void)
 /*! \brief returns number of active/allocated channels */
 int ast_active_channels(void)
 {
-	return current_channel_storage_instance ? CHANNELSTORAGE_API(current_channel_storage_instance, active_channels) : 0;
+	return current_channel_storage_instance ? CHANNELSTORAGE_API(current_channel_storage_instance, active_channels, 1) : 0;
 }
 
 int ast_undestroyed_channels(void)
@@ -706,7 +708,7 @@ static const struct ast_channel_tech null_tech = {
 static void ast_channel_destructor(void *obj);
 static void ast_dummy_channel_destructor(void *obj);
 
-static int do_ids_conflict(const struct ast_assigned_ids *assignedids)
+static int do_ids_conflict(const struct ast_assigned_ids *assignedids, int rdlock)
 {
 	struct ast_channel *conflict;
 
@@ -716,7 +718,7 @@ static int do_ids_conflict(const struct ast_assigned_ids *assignedids)
 
 	if (!ast_strlen_zero(assignedids->uniqueid)) {
 		conflict = CHANNELSTORAGE_API(current_channel_storage_instance,
-			get_by_uniqueid, assignedids->uniqueid);
+			get_by_uniqueid, assignedids->uniqueid, rdlock);
 		if (conflict) {
 			ast_log(LOG_ERROR, "Channel Unique ID '%s' already in use by channel %s(%p)\n",
 				assignedids->uniqueid, ast_channel_name(conflict), conflict);
@@ -727,7 +729,7 @@ static int do_ids_conflict(const struct ast_assigned_ids *assignedids)
 
 	if (!ast_strlen_zero(assignedids->uniqueid2)) {
 		conflict = CHANNELSTORAGE_API(current_channel_storage_instance,
-			get_by_uniqueid, assignedids->uniqueid2);
+			get_by_uniqueid, assignedids->uniqueid2, rdlock);
 		if (conflict) {
 			ast_log(LOG_ERROR, "Channel Unique ID2 '%s' already in use by channel %s(%p)\n",
 				assignedids->uniqueid2, ast_channel_name(conflict), conflict);
@@ -932,7 +934,7 @@ __ast_channel_alloc_ap(int needqueue, int state, const char *cid_num, const char
 
 	CHANNELSTORAGE_API(current_channel_storage_instance, wrlock);
 
-	if (do_ids_conflict(assignedids)) {
+	if (do_ids_conflict(assignedids, 0)) {
 		ast_channel_internal_errno_set(AST_CHANNEL_ERROR_ID_EXISTS);
 		ast_channel_unlock(tmp);
 		CHANNELSTORAGE_API(current_channel_storage_instance, unlock);
@@ -948,7 +950,7 @@ __ast_channel_alloc_ap(int needqueue, int state, const char *cid_num, const char
 
 
 	if (endpoint) {
-		ast_endpoint_add_channel(endpoint, tmp);
+		ast_channel_endpoint_set(tmp, endpoint);
 	}
 
 	/*
@@ -1179,9 +1181,13 @@ int ast_queue_frame_head(struct ast_channel *chan, struct ast_frame *fin)
 /*! \brief Queue a hangup frame for channel */
 int ast_queue_hangup(struct ast_channel *chan)
 {
-	RAII_VAR(struct ast_json *, blob, NULL, ast_json_unref);
+	RAII_VAR(struct ast_json *, blob, ast_json_object_create(), ast_json_unref);
 	struct ast_frame f = { AST_FRAME_CONTROL, .subclass.integer = AST_CONTROL_HANGUP };
-	int res, cause;
+	int res, cause, tech_cause;
+
+	if (!blob) {
+		return -1;
+	}
 
 	/* Yeah, let's not change a lock-critical value without locking */
 	ast_channel_lock(chan);
@@ -1189,8 +1195,11 @@ int ast_queue_hangup(struct ast_channel *chan)
 
 	cause = ast_channel_hangupcause(chan);
 	if (cause) {
-		blob = ast_json_pack("{s: i}",
-			"cause", cause);
+		ast_json_object_set(blob, "cause", ast_json_integer_create(cause));
+	}
+	tech_cause = ast_channel_tech_hangupcause(chan);
+	if (tech_cause) {
+		ast_json_object_set(blob, "tech_cause", ast_json_integer_create(tech_cause));
 	}
 
 	ast_channel_publish_blob(chan, ast_channel_hangup_request_type(), blob);
@@ -1206,6 +1215,7 @@ int ast_queue_hangup_with_cause(struct ast_channel *chan, int cause)
 	RAII_VAR(struct ast_json *, blob, NULL, ast_json_unref);
 	struct ast_frame f = { AST_FRAME_CONTROL, .subclass.integer = AST_CONTROL_HANGUP };
 	int res;
+	int tech_cause = 0;
 
 	if (cause >= 0) {
 		f.data.uint32 = cause;
@@ -1219,6 +1229,16 @@ int ast_queue_hangup_with_cause(struct ast_channel *chan, int cause)
 	}
 	blob = ast_json_pack("{s: i}",
 			     "cause", cause);
+	if (!blob) {
+		ast_channel_unlock(chan);
+		return -1;
+	}
+
+	tech_cause = ast_channel_tech_hangupcause(chan);
+	if (tech_cause) {
+		ast_json_object_set(blob, "tech_cause", ast_json_integer_create(tech_cause));
+	}
+
 	ast_channel_publish_blob(chan, ast_channel_hangup_request_type(), blob);
 
 	res = ast_queue_frame(chan, &f);
@@ -1323,7 +1343,7 @@ struct ast_channel *ast_channel_callback(
 		ast_log(LOG_ERROR, "callback function must be provided\n");
 		return NULL;
 	}
-	return CHANNELSTORAGE_API(current_channel_storage_instance, callback, cb_fn, arg, data, ao2_flags);
+	return CHANNELSTORAGE_API(current_channel_storage_instance, callback, cb_fn, arg, data, ao2_flags, 1);
 }
 
 struct ast_channel_iterator *ast_channel_iterator_destroy(struct ast_channel_iterator *i)
@@ -1387,7 +1407,7 @@ struct ast_channel *ast_channel_get_by_name_prefix(const char *name, size_t name
 		return NULL;
 	}
 
-	return CHANNELSTORAGE_API(current_channel_storage_instance, get_by_name_prefix_or_uniqueid, name, name_len);
+	return CHANNELSTORAGE_API(current_channel_storage_instance, get_by_name_prefix_or_uniqueid, name, name_len, 1);
 }
 
 /*
@@ -1404,7 +1424,7 @@ struct ast_channel *ast_channel_get_by_name(const char *name)
 		return NULL;
 	}
 
-	return CHANNELSTORAGE_API(current_channel_storage_instance, get_by_name_prefix_or_uniqueid, name, 0);
+	return CHANNELSTORAGE_API(current_channel_storage_instance, get_by_name_prefix_or_uniqueid, name, 0, 1);
 }
 
 struct ast_channel *ast_channel_get_by_exten(const char *exten, const char *context)
@@ -1416,7 +1436,7 @@ struct ast_channel *ast_channel_get_by_exten(const char *exten, const char *cont
 		ast_log(LOG_ERROR, "exten and context must be provided\n");
 		return NULL;
 	}
-	return CHANNELSTORAGE_API(current_channel_storage_instance, get_by_exten, exten, context);
+	return CHANNELSTORAGE_API(current_channel_storage_instance, get_by_exten, exten, context, 1);
 }
 
 struct ast_channel *ast_channel_get_by_uniqueid(const char *uniqueid)
@@ -1428,7 +1448,7 @@ struct ast_channel *ast_channel_get_by_uniqueid(const char *uniqueid)
 		ast_log(LOG_ERROR, "uniqueid must be provided\n");
 		return NULL;
 	}
-	return CHANNELSTORAGE_API(current_channel_storage_instance, get_by_uniqueid, uniqueid);
+	return CHANNELSTORAGE_API(current_channel_storage_instance, get_by_uniqueid, uniqueid, 1);
 }
 
 int ast_is_deferrable_frame(const struct ast_frame *frame)
@@ -2191,6 +2211,8 @@ static void ast_channel_destructor(void *obj)
 
 	ast_channel_lock(chan);
 
+	ast_channel_endpoint_set(chan, NULL);
+
 	/* Get rid of each of the data stores on the channel */
 	while ((datastore = AST_LIST_REMOVE_HEAD(ast_channel_datastores(chan), entry)))
 		/* Free the data store */
@@ -2441,12 +2463,32 @@ int ast_softhangup(struct ast_channel *chan, int cause)
 {
 	RAII_VAR(struct ast_json *, blob, NULL, ast_json_unref);
 	int res;
+	int tech_cause = 0;
+	struct ast_rtp_glue *glue;
+	RAII_VAR(struct ast_rtp_instance *, rtp, NULL, ao2_cleanup);
+	const struct ast_channel_tech *tech;
 
 	ast_channel_lock(chan);
+
+	tech = ast_channel_tech(chan);
+	glue = ast_rtp_instance_get_glue(tech->type);
+	if (glue) {
+		glue->get_rtp_info(chan, &rtp);
+		if (rtp) {
+			ast_rtp_instance_set_stats_vars(chan, rtp);
+		}
+	}
+
 	res = ast_softhangup_nolock(chan, cause);
 	blob = ast_json_pack("{s: i, s: b}",
 			     "cause", cause,
 			     "soft", 1);
+
+	tech_cause = ast_channel_tech_hangupcause(chan);
+	if (tech_cause) {
+		ast_json_object_set(blob, "tech_cause", ast_json_integer_create(tech_cause));
+	}
+
 	ast_channel_publish_blob(chan, ast_channel_hangup_request_type(), blob);
 	ast_channel_unlock(chan);
 
@@ -2646,8 +2688,9 @@ int ast_raw_answer_with_stream_topology(struct ast_channel *chan, struct ast_str
 		ast_channel_unlock(chan);
 		break;
 	case AST_STATE_UP:
-		break;
+		/* Fall through */
 	default:
+		ast_debug(2, "Skipping answer, since channel state on %s is %s\n", ast_channel_name(chan), ast_state2str(ast_channel_state(chan)));
 		break;
 	}
 
@@ -2864,7 +2907,12 @@ void ast_deactivate_generator(struct ast_channel *chan)
 	deactivate_generator_nolock(chan);
 	if (should_trigger_dtmf_emulating(chan)) {
 		/* if in the middle of dtmf emulation keep 50 tick per sec timer on rolling */
-		ast_timer_set_rate(ast_channel_timer(chan), 50);
+		struct ast_timer *timer = ast_channel_timer(chan);
+		if (timer) {
+			ast_timer_set_rate(timer, 50);
+		} else {
+			ast_log(LOG_WARNING, "No timing module loaded, DTMF length may be inaccurate\n");
+		}
 	}
 	ast_channel_unlock(chan);
 }
@@ -3154,6 +3202,7 @@ int ast_settimeout_full(struct ast_channel *c, unsigned int rate, int (*func)(co
 {
 	int res;
 	unsigned int real_rate = rate, max_rate;
+	struct ast_timer *timer = ast_channel_timer(c);
 
 	ast_channel_lock(c);
 
@@ -3167,13 +3216,13 @@ int ast_settimeout_full(struct ast_channel *c, unsigned int rate, int (*func)(co
 		data = NULL;
 	}
 
-	if (rate && rate > (max_rate = ast_timer_get_max_rate(ast_channel_timer(c)))) {
+	if (rate && rate > (max_rate = ast_timer_get_max_rate(timer))) {
 		real_rate = max_rate;
 	}
 
 	ast_debug(3, "Scheduling timer at (%u requested / %u actual) timer ticks per second\n", rate, real_rate);
 
-	res = ast_timer_set_rate(ast_channel_timer(c), real_rate);
+	res = ast_timer_set_rate(timer, real_rate);
 
 	if (ast_channel_timingdata(c) && ast_test_flag(ast_channel_flags(c), AST_FLAG_TIMINGDATA_IS_AO2_OBJ)) {
 		ao2_ref(ast_channel_timingdata(c), -1);
@@ -3338,34 +3387,45 @@ static const char *dtmf_direction_to_string(enum DtmfDirection direction)
 static void send_dtmf_begin_event(struct ast_channel *chan,
 	enum DtmfDirection direction, const char digit)
 {
-	RAII_VAR(struct ast_json *, blob, NULL, ast_json_unref);
+	RAII_VAR(struct ast_json *, channel_blob, NULL, ast_json_unref);
 	char digit_str[] = { digit, '\0' };
 
-	blob = ast_json_pack("{ s: s, s: s }",
+	channel_blob = ast_json_pack("{ s: s, s: s }",
 		"digit", digit_str,
 		"direction", dtmf_direction_to_string(direction));
-	if (!blob) {
-		return;
-	}
 
-	ast_channel_publish_blob(chan, ast_channel_dtmf_begin_type(), blob);
+	if (channel_blob) {
+		ast_channel_publish_blob(chan, ast_channel_dtmf_begin_type(), channel_blob);
+	}
 }
 
 static void send_dtmf_end_event(struct ast_channel *chan,
 	enum DtmfDirection direction, const char digit, long duration_ms)
 {
-	RAII_VAR(struct ast_json *, blob, NULL, ast_json_unref);
+	RAII_VAR(struct ast_json *, channel_blob, NULL, ast_json_unref);
+	RAII_VAR(struct ast_json *, cel_blob, NULL, ast_json_unref);
 	char digit_str[] = { digit, '\0' };
 
-	blob = ast_json_pack("{ s: s, s: s, s: I }",
+	channel_blob = ast_json_pack("{ s: s, s: s, s: I }",
 		"digit", digit_str,
 		"direction", dtmf_direction_to_string(direction),
 		"duration_ms", (ast_json_int_t)duration_ms);
-	if (!blob) {
-		return;
+
+	if (channel_blob) {
+		ast_channel_publish_blob(chan, ast_channel_dtmf_end_type(), channel_blob);
 	}
 
-	ast_channel_publish_blob(chan, ast_channel_dtmf_end_type(), blob);
+	cel_blob = ast_json_pack("{ s: s, s: { s: s, s: I }}",
+		"event", dtmf_direction_to_string(direction),
+		"extra",
+			"digit", digit_str,
+			"duration_ms", (ast_json_int_t)duration_ms);
+
+	if (cel_blob) {
+		ast_cel_publish_event(chan, AST_CEL_DTMF, cel_blob);
+	} else {
+		ast_log(LOG_WARNING, "Unable to build extradata for DTMF CEL event on channel %s", ast_channel_name(chan));
+	}
 }
 
 static void send_flash_event(struct ast_channel *chan)
@@ -3527,16 +3587,12 @@ static struct ast_frame *__ast_read(struct ast_channel *chan, int dropaudio, int
 		 * The ast_waitfor() code records which of the channel's file
 		 * descriptors reported that data is available.  In theory,
 		 * ast_read() should only be called after ast_waitfor() reports
-		 * that a channel has data available for reading.  However,
-		 * there still may be some edge cases throughout the code where
-		 * ast_read() is called improperly.  This can potentially cause
-		 * problems, so if this is a developer build, make a lot of
-		 * noise if this happens so that it can be addressed.
-		 *
-		 * One of the potential problems is blocking on a dead channel.
+		 * that a channel has data available for reading but certain
+		 * situations with stasis and ARI could give a false indication.
+		 * For this reason, we don't stop any processing.
 		 */
 		if (ast_channel_fdno(chan) == -1) {
-			ast_log(LOG_ERROR,
+			ast_debug(3,
 				"ast_read() on chan '%s' called with no recorded file descriptor.\n",
 				ast_channel_name(chan));
 		}
@@ -3876,7 +3932,12 @@ static struct ast_frame *__ast_read(struct ast_channel *chan, int dropaudio, int
 					 * timer events to generate null frames.
 					 */
 					if (!ast_channel_generator(chan)) {
-						ast_timer_set_rate(ast_channel_timer(chan), 50);
+						struct ast_timer *timer = ast_channel_timer(chan);
+						if (timer) {
+							ast_timer_set_rate(timer, 50);
+					    } else {
+							ast_log(LOG_WARNING, "No timing module loaded, DTMF length may be inaccurate\n");
+						}
 					}
 				}
 				if (ast_channel_audiohooks(chan)) {
@@ -3926,7 +3987,12 @@ static struct ast_frame *__ast_read(struct ast_channel *chan, int dropaudio, int
 					 * timer events to generate null frames.
 					 */
 					if (!ast_channel_generator(chan)) {
-						ast_timer_set_rate(ast_channel_timer(chan), 50);
+						struct ast_timer *timer = ast_channel_timer(chan);
+						if (timer) {
+							ast_timer_set_rate(timer, 50);
+						} else {
+							ast_log(LOG_WARNING, "No timing module loaded, DTMF length may be inaccurate\n");
+						}
 					}
 				} else {
 					ast_log(LOG_DTMF, "DTMF end passthrough '%c' on %s\n", f->subclass.integer, ast_channel_name(chan));
@@ -3941,7 +4007,12 @@ static struct ast_frame *__ast_read(struct ast_channel *chan, int dropaudio, int
 					 * timer events to generate null frames.
 					 */
 					if (!ast_channel_generator(chan)) {
-						ast_timer_set_rate(ast_channel_timer(chan), 50);
+						struct ast_timer *timer = ast_channel_timer(chan);
+						if (timer) {
+							ast_timer_set_rate(timer, 50);
+						} else {
+							ast_log(LOG_WARNING, "No timing module loaded, DTMF length may be inaccurate\n");
+						}
 					}
 				}
 				if (ast_channel_audiohooks(chan)) {
@@ -4003,7 +4074,12 @@ static struct ast_frame *__ast_read(struct ast_channel *chan, int dropaudio, int
 					 * timer events to generate null frames.
 					 */
 					if (!ast_channel_generator(chan)) {
-						ast_timer_set_rate(ast_channel_timer(chan), 50);
+						struct ast_timer *timer = ast_channel_timer(chan);
+						if (timer) {
+							ast_timer_set_rate(timer, 50);
+						} else {
+							ast_log(LOG_WARNING, "No timing module loaded, DTMF length may be inaccurate\n");
+						}
 					}
 				}
 			}
@@ -6945,6 +7021,9 @@ static void channel_do_masquerade(struct ast_channel *original, struct ast_chann
 
 	/* The old snapshots need to follow the channels so the snapshot update is correct */
 	ast_channel_internal_swap_snapshots(clonechan, original);
+
+	/* Now we swap the endpoints if present */
+	ast_channel_internal_swap_endpoints(clonechan, original);
 
 	/* Swap channel names. This uses ast_channel_name_set directly, so we
 	 * don't get any spurious rename events.
@@ -10479,6 +10558,10 @@ int ast_channel_cc_params_init(struct ast_channel *chan,
 struct ast_cc_config_params *ast_channel_get_cc_config_params(struct ast_channel *chan)
 {
 	struct ast_datastore *cc_datastore;
+
+	if (!ast_cc_is_enabled()) {
+		return NULL;
+	}
 
 	if (!(cc_datastore = ast_channel_datastore_find(chan, &cc_channel_datastore_info, NULL))) {
 		/* If we can't find the datastore, it almost definitely means that the channel type being
