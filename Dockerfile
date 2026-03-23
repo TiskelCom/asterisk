@@ -2,7 +2,10 @@
 FROM debian:bullseye-slim AS builder
 
 # Install build dependencies
-RUN apt-get update && apt-get install -y \
+# Replace ldconfig with no-op to prevent SIGSEGV under QEMU arm64 emulation
+RUN mv /sbin/ldconfig /sbin/ldconfig.REAL \
+    && printf '#!/bin/sh\nexit 0\n' > /sbin/ldconfig && chmod +x /sbin/ldconfig \
+    && apt-get update && apt-get install -y \
     build-essential \
     wget \
     libedit-dev \
@@ -33,6 +36,7 @@ RUN apt-get update && apt-get install -y \
     libmariadb-dev \
     libmariadb-dev-compat \
     libhiredis-dev \
+    && mv /sbin/ldconfig.REAL /sbin/ldconfig \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy our complete Asterisk source tree (includes modified AudioSocket)
@@ -58,13 +62,17 @@ RUN find /usr/lib -name "libasterisk*.so*" -ls
 FROM debian:bullseye-slim
 
 # Install runtime dependencies
-RUN apt-get update && apt-get install -y \
+# Replace ldconfig with no-op to prevent SIGSEGV under QEMU arm64 emulation
+RUN mv /sbin/ldconfig /sbin/ldconfig.REAL \
+    && printf '#!/bin/sh\nexit 0\n' > /sbin/ldconfig && chmod +x /sbin/ldconfig \
+    && apt-get update && apt-get install -y \
     libedit2 libjansson4 libxml2 libsqlite3-0 libssl1.1 \
     libsrtp2-1 libspandsp2 libspeex1 libspeexdsp1 libcurl4 \
     libogg0 libvorbis0a libpq5 unixodbc libresample1 libpopt0 \
     libgsm1 libopus0 libopusfile0 liblua5.2-0 libiksemel3 \
     libsnmp40 libunbound8 libldap-2.4-2 libmariadb3 libhiredis0.14 \
     tzdata \
+    && mv /sbin/ldconfig.REAL /sbin/ldconfig \
     && rm -rf /var/lib/apt/lists/*
 
 # Create asterisk user
