@@ -282,7 +282,7 @@ struct ast_frame *ast_audiosocket_receive_frame(const int svc)
 struct ast_frame *ast_audiosocket_receive_frame_with_hangup(const int svc,
 	int *const hangup)
 {
-	int i = 0, n = 0, ret = 0;
+	int i = 0, n = 0, ret = 0, header_retries = 0;
 	struct ast_frame f = {
 		.frametype = AST_FRAME_VOICE,
 		.src = "AudioSocket",
@@ -293,6 +293,8 @@ struct ast_frame *ast_audiosocket_receive_frame_with_hangup(const int svc,
 	uint16_t *length = (uint16_t *) &header[1];
 	uint8_t *data;
 
+#define HEADER_READ_MAX_RETRIES 100
+
 	if (hangup) {
 		*hangup = 0;
 	}
@@ -300,13 +302,20 @@ struct ast_frame *ast_audiosocket_receive_frame_with_hangup(const int svc,
 	while (i < 3) {
 		n = read(svc, header + i, 3 - i);
 		if (n == -1) {
+			if (errno == EINTR) {
+				continue;
+			}
 			if (errno == EAGAIN || errno == EWOULDBLOCK) {
 				int poll_result = ast_wait_for_input(svc, 5);
 
 				if (poll_result == 1) {
 					continue;
 				} else if (poll_result == 0) {
-					ast_debug(1, "Poll timed out while waiting for header data\n");
+					if (++header_retries >= HEADER_READ_MAX_RETRIES) {
+						ast_debug(1, "AudioSocket header read timed out after %d ms\n",
+							header_retries * 5);
+						return &ast_null_frame;
+					}
 					continue;
 				} else {
 					ast_log(LOG_WARNING, "Poll error: %s\n", strerror(errno));
@@ -382,6 +391,9 @@ struct ast_frame *ast_audiosocket_receive_frame_with_hangup(const int svc,
 	while (i < *length) {
 		n = read(svc, data + i, *length - i);
 		if (n == -1) {
+			if (errno == EINTR) {
+				continue;
+			}
 			if (errno == EAGAIN || errno == EWOULDBLOCK) {
 				int poll_result = ast_wait_for_input(svc, 5);
 
