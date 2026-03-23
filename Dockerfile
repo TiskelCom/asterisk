@@ -38,6 +38,9 @@ RUN apt-get update && apt-get install -y \
 # Copy our complete Asterisk source tree (includes modified AudioSocket)
 COPY . /usr/src/asterisk
 
+# Fix Windows CRLF line endings on all source files
+RUN find /usr/src/asterisk -type f -print0 | xargs -0 sed -i 's/\r$//'
+
 # Build Asterisk
 WORKDIR /usr/src/asterisk
 RUN ./configure --with-jansson-bundled \
