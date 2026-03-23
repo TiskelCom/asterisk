@@ -5,7 +5,6 @@ FROM debian:bullseye-slim AS builder
 RUN apt-get update && apt-get install -y \
     build-essential \
     wget \
-    git \
     libedit-dev \
     uuid-dev \
     libjansson-dev \
@@ -36,12 +35,8 @@ RUN apt-get update && apt-get install -y \
     libhiredis-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Clone Asterisk repository
-RUN git clone https://github.com/asterisk/asterisk.git /usr/src/asterisk
-
-# Copy our modified AudioSocket sources
-COPY res/res_audiosocket.c /usr/src/asterisk/res/
-COPY channels/chan_audiosocket.c /usr/src/asterisk/channels/
+# Copy our complete Asterisk source tree (includes modified AudioSocket)
+COPY . /usr/src/asterisk
 
 # Build Asterisk
 WORKDIR /usr/src/asterisk
