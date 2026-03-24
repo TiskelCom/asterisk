@@ -36,7 +36,6 @@ RUN mv /sbin/ldconfig /sbin/ldconfig.REAL \
     libmariadb-dev \
     libmariadb-dev-compat \
     libhiredis-dev \
-    && mv /sbin/ldconfig.REAL /sbin/ldconfig \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy our complete Asterisk source tree (includes modified AudioSocket)
