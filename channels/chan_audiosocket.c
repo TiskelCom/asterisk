@@ -143,6 +143,32 @@ static int audiosocket_call(struct ast_channel *ast, const char *dest, int timeo
 {
 	struct audiosocket_instance *instance = ast_channel_tech_pvt(ast);
 
+	/* Support asymmetric read/write formats via channel variable.
+	 * When AUDIOSOCKET_READ_FORMAT is set, the external app sends audio in a
+	 * different format than it receives. Asterisk translators handle conversion.
+	 * Example: format=slin16 (write to app) + AUDIOSOCKET_READ_FORMAT=slin24 (read from app) */
+	const char *read_fmt_name = pbx_builtin_getvar_helper(ast, "AUDIOSOCKET_READ_FORMAT");
+	if (!ast_strlen_zero(read_fmt_name)) {
+		struct ast_format *read_fmt = ast_format_cache_get(read_fmt_name);
+		if (read_fmt) {
+			struct ast_format_cap *caps = ast_format_cap_alloc(AST_FORMAT_CAP_FLAG_DEFAULT);
+			if (caps) {
+				ast_format_cap_append(caps, ast_channel_writeformat(ast), 0);
+				ast_format_cap_append(caps, read_fmt, 0);
+				ast_channel_nativeformats_set(ast, caps);
+				ao2_ref(caps, -1);
+			}
+			ast_channel_set_readformat(ast, read_fmt);
+			ast_channel_set_rawreadformat(ast, read_fmt);
+			ao2_ref(read_fmt, -1);
+			ast_debug(1, "AudioSocket: read format overridden to '%s' via AUDIOSOCKET_READ_FORMAT\n",
+				read_fmt_name);
+		} else {
+			ast_log(LOG_WARNING, "AudioSocket: AUDIOSOCKET_READ_FORMAT '%s' not found, using default\n",
+				read_fmt_name);
+		}
+	}
+
 	ast_queue_control(ast, AST_CONTROL_ANSWER);
 
 	return ast_audiosocket_init(instance->svc, instance->id);
